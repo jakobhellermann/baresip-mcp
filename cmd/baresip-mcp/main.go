@@ -76,17 +76,22 @@ func main() {
 	defer client.Close()
 
 	events := baresip.NewEventBuffer(*bufSize)
-	go func() {
-		for ev := range client.Events() {
-			events.Add(ev)
-			log.Printf("baresip event: class=%s type=%s param=%s", ev.Class, ev.Type, ev.Param)
-		}
-	}()
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "baresip-mcp",
 		Version: "0.1.0",
 	}, nil)
+
+	// Fan events out to: ring buffer (queryable via recent_events),
+	// stderr log, and a "logging/message" notification to every
+	// connected MCP session so clients see real-time updates.
+	go func() {
+		for ev := range client.Events() {
+			events.Add(ev)
+			log.Printf("baresip event: class=%s type=%s param=%s", ev.Class, ev.Type, ev.Param)
+			notifyEvent(server, ev)
+		}
+	}()
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "dial",
@@ -118,10 +123,8 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_calls",
-		Description: "List all active calls.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "listcalls", "")
-	})
+		Description: "List all active calls. Returns structured per-UA call details.",
+	}, listCallsHandler(client))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "call_status",
@@ -211,6 +214,30 @@ func main() {
 	}
 }
 
+type listCallsOutput struct {
+	UserAgents []baresip.UserAgentCalls `json:"user_agents"`
+	Raw        string                   `json:"raw"`
+}
+
+func listCallsHandler(c *baresip.Client) func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, listCallsOutput, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, listCallsOutput, error) {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		resp, err := c.Do(cctx, "listcalls", "")
+		if err != nil {
+			return nil, listCallsOutput{}, err
+		}
+		out := listCallsOutput{
+			UserAgents: baresip.ParseListCalls(resp.Data),
+			Raw:        resp.Data,
+		}
+		return &mcp.CallToolResult{
+			IsError: !resp.OK,
+			Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
+		}, out, nil
+	}
+}
+
 func runCmd(ctx context.Context, c *baresip.Client, cmd, params string) (*mcp.CallToolResult, any, error) {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -230,6 +257,25 @@ func runCmd(ctx context.Context, c *baresip.Client, cmd, params string) (*mcp.Ca
 		IsError: !resp.OK,
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
+}
+
+func notifyEvent(server *mcp.Server, ev baresip.Event) {
+	params := &mcp.LoggingMessageParams{
+		Level:  "info",
+		Logger: "baresip",
+		Data: map[string]any{
+			"class": ev.Class,
+			"type":  ev.Type,
+			"param": ev.Param,
+			"extra": ev.Extra,
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for session := range server.Sessions() {
+		// Best-effort: a slow or dead client must not block the event pump.
+		_ = session.Log(ctx, params)
+	}
 }
 
 func envOr(key, fallback string) string {
