@@ -97,7 +97,7 @@ if ! grep -q '"uri":"baresip://events"' <<<"$OUT"; then
   echo "FAIL: events resource not listed/readable"
   exit 1
 fi
-for tool in dial accept hangup hangup_all list_calls call_status reginfo hold mute transfer dtmf uafind recent_events command; do
+for tool in dial accept hangup hangup_all list_calls call_status reginfo hold mute transfer dtmf uafind register unregister recent_events command; do
   if ! grep -q "\"name\":\"$tool\"" <<<"$OUT"; then
     echo "FAIL: tool '$tool' not advertised in tools/list"
     exit 1

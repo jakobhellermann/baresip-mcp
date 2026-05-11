@@ -23,7 +23,8 @@ const (
 )
 
 type dialInput struct {
-	URI string `json:"uri" jsonschema:"SIP URI to dial, e.g. sip:alice@example.com"`
+	URI  string `json:"uri" jsonschema:"SIP URI to dial, e.g. sip:alice@example.com"`
+	From string `json:"from,omitempty" jsonschema:"optional AOR of the local account to call from, e.g. sip:1126226e1@proxy.dev.sipgate.de. If omitted, baresip picks a matching UA by URI host."`
 }
 
 type empty struct{}
@@ -55,6 +56,15 @@ type hangupAllInput struct {
 
 type uafindInput struct {
 	AOR string `json:"aor" jsonschema:"address-of-record to look up, e.g. sip:alice@example.com"`
+}
+
+type registerInput struct {
+	AOR    string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
+	Regint int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 600). 0 means do not register."`
+}
+
+type unregisterInput struct {
+	AOR string `json:"aor" jsonschema:"AOR of the account to deregister"`
 }
 
 type recentEventsInput struct {
@@ -115,8 +125,23 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "dial",
-		Description: "Place an outgoing SIP call to the given URI via baresip.",
+		Description: "Place an outgoing SIP call to the given URI via baresip. Pass 'from' to pick a specific local account as the caller.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dialInput) (*mcp.CallToolResult, any, error) {
+		if in.From != "" {
+			// uafind raises the selected UA so the following dial uses it.
+			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			resp, err := client.Do(cctx, "uafind", in.From)
+			cancel()
+			if err != nil {
+				return nil, nil, err
+			}
+			if !resp.OK {
+				return &mcp.CallToolResult{
+					IsError: true,
+					Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
+				}, nil, nil
+			}
+		}
 		return runCmd(ctx, client, "dial", in.URI)
 	})
 
@@ -197,9 +222,51 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "uafind",
-		Description: "Find a configured User-Agent by address-of-record.",
+		Description: "Find a configured User-Agent by address-of-record and make it the current one.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in uafindInput) (*mcp.CallToolResult, any, error) {
 		return runCmd(ctx, client, "uafind", in.AOR)
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "register",
+		Description: "Register a configured SIP account at its provider so it can receive incoming calls. Pass regint=0 to stop registering.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, any, error) {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		resp, err := client.Do(cctx, "uafind", in.AOR)
+		cancel()
+		if err != nil {
+			return nil, nil, err
+		}
+		if !resp.OK {
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
+			}, nil, nil
+		}
+		regint := in.Regint
+		if regint == 0 {
+			regint = 600
+		}
+		return runCmd(ctx, client, "uareg", fmt.Sprintf("%d", regint))
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "unregister",
+		Description: "Deregister a SIP account (regint=0). The account stays loaded but is no longer reachable for incoming calls.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in unregisterInput) (*mcp.CallToolResult, any, error) {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		resp, err := client.Do(cctx, "uafind", in.AOR)
+		cancel()
+		if err != nil {
+			return nil, nil, err
+		}
+		if !resp.OK {
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
+			}, nil, nil
+		}
+		return runCmd(ctx, client, "uareg", "0")
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
