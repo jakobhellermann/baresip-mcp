@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"syscall"
 	"time"
@@ -18,10 +19,7 @@ import (
 	"github.com/sipgate/baresip-mcp/pkg/baresip"
 )
 
-const (
-	defaultAddr       = "127.0.0.1:4444"
-	eventsResourceURI = "baresip://events"
-)
+const eventsResourceURI = "baresip://events"
 
 type dialInput struct {
 	URI     string            `json:"uri" jsonschema:"SIP URI to dial, e.g. sip:alice@example.com"`
@@ -74,25 +72,25 @@ type recentEventsInput struct {
 }
 
 func main() {
-	addr := flag.String("addr", envOr("BARESIP_CTRL_ADDR", defaultAddr), "baresip ctrl_tcp address host:port")
+	accountsPath := flag.String("accounts", envOr("BARESIP_ACCOUNTS", defaultAccountsPath()), "path to a baresip accounts file (copied into the child baresip's tmpdir)")
 	bufSize := flag.Int("event-buffer", 256, "size of the recent-events ring buffer")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	client := baresip.New(*addr)
-	// Try an immediate connect so the common case (baresip already up)
-	// has tools working from the first request. If baresip isn't up yet,
-	// fall back to lazy mode — start the supervisor without an initial
-	// connection so tool calls return ErrDisconnected until baresip comes
-	// up, instead of crashing the MCP server.
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	instance, err := spawnBaresip(*accountsPath)
+	if err != nil {
+		log.Fatalf("spawn baresip: %v", err)
+	}
+	defer instance.Close()
+	log.Printf("spawned baresip ctrl_tcp=%s tmpdir=%s log=%s", instance.addr, instance.tmpDir, instance.logPath)
+
+	client := baresip.New(instance.addr)
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	if err := client.Connect(dialCtx); err != nil {
-		log.Printf("baresip ctrl_tcp %s not yet reachable (%v); will retry in background", *addr, err)
-		client.Start()
-	} else {
-		log.Printf("connected to baresip ctrl_tcp at %s", *addr)
+		cancel()
+		log.Fatalf("connect spawned baresip at %s: %v", instance.addr, err)
 	}
 	cancel()
 	defer client.Close()
@@ -494,6 +492,14 @@ func notifyEvent(server *mcp.Server, ev baresip.Event) {
 		// Best-effort: a slow or dead client must not block the event pump.
 		_ = session.Log(ctx, params)
 	}
+}
+
+func defaultAccountsPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".baresip", "accounts")
 }
 
 func envOr(key, fallback string) string {
