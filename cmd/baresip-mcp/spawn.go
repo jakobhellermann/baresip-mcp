@@ -3,13 +3,19 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
+
+const tmpDirPrefix = "baresip-mcp-"
 
 // baresipInstance is a baresip child process we own. It writes its config
 // and accounts into a tmpdir and shuts down cleanly on Close.
@@ -25,12 +31,91 @@ func (b *baresipInstance) Close() {
 		return
 	}
 	if b.cmd != nil && b.cmd.Process != nil {
-		_ = b.cmd.Process.Kill()
-		_, _ = b.cmd.Process.Wait()
+		// SIGTERM first so baresip can unregister from its provider and
+		// flush its sockets. Fall back to SIGKILL after a short grace
+		// period in case it ignored us.
+		_ = b.cmd.Process.Signal(syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() {
+			_, _ = b.cmd.Process.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			_ = b.cmd.Process.Kill()
+			<-done
+		}
 	}
 	if b.tmpDir != "" {
 		_ = os.RemoveAll(b.tmpDir)
 	}
+}
+
+// sweepOrphans kills any leftover baresip processes that were spawned by
+// an earlier baresip-mcp and survived its (likely SIGKILL'd) parent. We
+// can't rely on PR_SET_PDEATHSIG (Linux-only) and Claude Code does not
+// reliably let us run our shutdown defer, so each new MCP starts by
+// taking out the previous instances' stragglers.
+//
+// Only orphans (ppid=1) get touched. Tmpdirs of *live* baresips that
+// belong to a sibling baresip-mcp must be left alone.
+func sweepOrphans() {
+	out, err := exec.Command("ps", "-eo", "pid,ppid,args").Output()
+	if err != nil {
+		return
+	}
+	tmpRoot := os.TempDir()
+	killedDirs := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, _ := strconv.Atoi(fields[0])
+		ppid, _ := strconv.Atoi(fields[1])
+		args := strings.Join(fields[2:], " ")
+		if pid == 0 || ppid != 1 {
+			continue
+		}
+		// Match only baresip processes started against one of our tmpdirs.
+		if !strings.Contains(args, "baresip ") && !strings.HasSuffix(fields[2], "/baresip") {
+			continue
+		}
+		dir := extractTmpDir(args, tmpRoot)
+		if dir == "" {
+			continue
+		}
+		log.Printf("sweeping orphan baresip pid=%d tmpdir=%s", pid, dir)
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+		killedDirs[dir] = true
+	}
+
+	// Remove only the tmpdirs whose baresip we just killed. Other
+	// baresip-mcp-* dirs may belong to live siblings (other Claude
+	// sessions) and must be left alone.
+	for dir := range killedDirs {
+		_ = os.RemoveAll(dir)
+	}
+}
+
+// extractTmpDir parses baresip's '-f <cfgdir>' argv and returns the
+// parent tmpdir if it lives under tmpRoot and matches our prefix.
+func extractTmpDir(args, tmpRoot string) string {
+	idx := strings.Index(args, "-f ")
+	if idx < 0 {
+		return ""
+	}
+	rest := args[idx+3:]
+	if end := strings.Index(rest, " "); end >= 0 {
+		rest = rest[:end]
+	}
+	// rest looks like /<tmpRoot>/baresip-mcp-NNN/.baresip
+	rest = strings.TrimSuffix(rest, "/.baresip")
+	if !strings.HasPrefix(rest, filepath.Join(tmpRoot, tmpDirPrefix)) {
+		return ""
+	}
+	return rest
 }
 
 // spawnBaresip writes a self-contained config + accounts into a tmpdir,
@@ -47,7 +132,7 @@ func spawnBaresip(accountsSource string) (*baresipInstance, error) {
 		return nil, fmt.Errorf("find free tcp port: %w", err)
 	}
 
-	tmp, err := os.MkdirTemp("", "baresip-mcp-")
+	tmp, err := os.MkdirTemp("", tmpDirPrefix)
 	if err != nil {
 		return nil, err
 	}

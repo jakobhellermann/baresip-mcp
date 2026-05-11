@@ -89,6 +89,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Take out any baresips left over from previous MCP instances that
+	// died without running their defer (Claude Code SIGKILL on reload).
+	sweepOrphans()
+
 	instance, err := spawnBaresip(*accountsPath)
 	if err != nil {
 		log.Fatalf("spawn baresip: %v", err)
