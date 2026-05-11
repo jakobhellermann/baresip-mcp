@@ -6,11 +6,34 @@ import (
 	"os"
 )
 
+// writeRingbackWAV writes a single period of EU ringback (1 s of a
+// 425 Hz tone + 3 s silence) as 16-bit PCM mono 8 kHz WAV. baresip
+// loops the file while the callee rings, so a single cadence period is
+// all we need.
+func writeRingbackWAV(path string) error {
+	return writePCMWAV(path, func(add func(float64, int, float64), addSilence func(int)) {
+		add(425, 1000, 8000)
+		addSilence(3000)
+	})
+}
+
 // writeGreetingWAV writes a short two-tone greeting followed by silence
 // to path as 16-bit PCM mono 8 kHz WAV. baresip's aufile audio source
 // plays the file once when the call is established; after the greeting
 // finishes the source stops and the caller hears silence.
 func writeGreetingWAV(path string) error {
+	return writePCMWAV(path, func(addTone func(float64, int, float64), addSilence func(int)) {
+		// "ding-ding" pattern: 880Hz then 1320Hz, comfortable volume.
+		addTone(880, 180, 6000)
+		addSilence(80)
+		addTone(1320, 180, 6000)
+		addSilence(200)
+	})
+}
+
+// writePCMWAV builds a sample buffer via the build callback and writes
+// it as 8 kHz mono 16-bit PCM WAV at path.
+func writePCMWAV(path string, build func(addTone func(freq float64, ms int, amp float64), addSilence func(ms int))) error {
 	const sampleRate = 8000
 
 	var samples []int16
@@ -36,11 +59,7 @@ func writeGreetingWAV(path string) error {
 		}
 	}
 
-	// "ding-ding" pattern: 880Hz then 1320Hz, comfortable volume.
-	addTone(880, 180, 6000)
-	addSilence(80)
-	addTone(1320, 180, 6000)
-	addSilence(200)
+	build(addTone, addSilence)
 
 	f, err := os.Create(path)
 	if err != nil {

@@ -42,8 +42,8 @@ if ! grep -q '"id":2' <<<"$OUT"; then
   echo "FAIL: no response with id=2"
   exit 1
 fi
-if ! grep -q 'User Agents' <<<"$OUT"; then
-  echo "FAIL: reginfo content did not include 'User Agents'"
+if ! grep -qE 'User Agents|dormant' <<<"$OUT"; then
+  echo "FAIL: reginfo content did not include 'User Agents' or 'dormant'"
   exit 1
 fi
 if ! grep -q '"id":3' <<<"$OUT"; then

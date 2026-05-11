@@ -246,7 +246,7 @@ func main() {
 		Description: "Send an arbitrary baresip long-form command. Pass 'aor' to route to a specific instance, else broadcast.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in rawInput) (*mcp.CallToolResult, any, error) {
 		if in.AOR != "" {
-			c, err := fleet.ClientFor(in.AOR)
+			c, err := fleet.ClientFor(ctx, in.AOR)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -270,7 +270,7 @@ func dialHandler(ctx context.Context, f *Fleet, in dialInput) (*mcp.CallToolResu
 			Content: []mcp.Content{&mcp.TextContent{Text: "'from' is required (which account dials)"}},
 		}, nil, nil
 	}
-	c, err := f.ClientFor(in.From)
+	c, err := f.ClientFor(ctx, in.From)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -308,7 +308,7 @@ func dialHandler(ctx context.Context, f *Fleet, in dialInput) (*mcp.CallToolResu
 }
 
 func uaregOn(ctx context.Context, f *Fleet, aor string, regint int) (*mcp.CallToolResult, any, error) {
-	c, err := f.ClientFor(aor)
+	c, err := f.ClientFor(ctx, aor)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -321,7 +321,7 @@ func uaregOn(ctx context.Context, f *Fleet, aor string, regint int) (*mcp.CallTo
 func broadcast(ctx context.Context, f *Fleet, cmd, params string) (*mcp.CallToolResult, any, error) {
 	var combined []string
 	var lastErr error
-	for aor, c := range f.All() {
+	for aor, c := range f.LiveClients() {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		resp, err := c.Do(cctx, cmd, params)
 		cancel()
@@ -354,7 +354,7 @@ func broadcastOrTargeted(ctx context.Context, f *Fleet, aor, callID, cmd, params
 	case callID != "":
 		c, _, err = f.ClientForCall(callID)
 	case aor != "":
-		c, err = f.ClientFor(aor)
+		c, err = f.ClientFor(ctx, aor)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -374,7 +374,7 @@ func listCallsHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, empt
 	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, listCallsOutput, error) {
 		var rawParts []string
 		var uas []baresip.UserAgentCalls
-		for aor, c := range f.All() {
+		for aor, c := range f.LiveClients() {
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			resp, err := c.Do(cctx, "listcalls", "")
 			cancel()
@@ -398,13 +398,13 @@ type reginfoOutput struct {
 
 func reginfoHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, reginfoOutput, error) {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, reginfoOutput, error) {
+		// Show live registrations from running instances only. Reading
+		// reginfo should not force a spawn — that's reserved for tools
+		// that actually need the baresip running (dial, register, …).
+		live := f.LiveClients()
 		var rawParts []string
 		var regs []baresip.Registration
-		for _, aor := range f.AccountAORs() {
-			c, err := f.ClientFor(aor)
-			if err != nil {
-				continue
-			}
+		for aor, c := range live {
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			resp, err := c.Do(cctx, "reginfo", "")
 			cancel()
@@ -414,6 +414,19 @@ func reginfoHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, empty)
 			rawParts = append(rawParts, fmt.Sprintf("--- %s ---\n%s", aor, resp.Data))
 			regs = append(regs, baresip.ParseRegInfo(resp.Data)...)
 		}
+
+		var dormant []string
+		for _, aor := range f.AccountAORs() {
+			if _, running := live[aor]; !running {
+				dormant = append(dormant, aor)
+			}
+		}
+		if len(dormant) > 0 {
+			rawParts = append(rawParts,
+				fmt.Sprintf("--- dormant (configured but baresip not spawned yet) ---\n%s\n",
+					strings.Join(dormant, "\n")))
+		}
+
 		raw := strings.Join(rawParts, "\n")
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: raw}},
