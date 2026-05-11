@@ -51,7 +51,7 @@ if ! grep -q '"user_agents"' <<<"$OUT"; then
   echo "FAIL: list_calls did not return structured output"
   exit 1
 fi
-for tool in dial accept hangup hangup_all list_calls call_status reginfo hold mute transfer dtmf uafind register unregister recent_events command; do
+for tool in dial accept hangup hangup_all list_calls call_status reginfo hold mute transfer dtmf uafind register unregister recent_events wait_for_event command; do
   if ! grep -q "\"name\":\"$tool\"" <<<"$OUT"; then
     echo "FAIL: tool '$tool' not advertised in tools/list"
     exit 1

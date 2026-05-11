@@ -69,6 +69,18 @@ type recentEventsInput struct {
 	Limit int `json:"limit,omitempty" jsonschema:"max number of most recent events to return (default 50)"`
 }
 
+type waitForEventInput struct {
+	Types           []string `json:"types,omitempty" jsonschema:"event types to match (e.g. CALL_ESTABLISHED, CALL_CLOSED). Empty matches any event."`
+	CallID          string   `json:"call_id,omitempty" jsonschema:"optional baresip call id to filter on. If set, only events for that call match."`
+	TimeoutSeconds  int      `json:"timeout_seconds,omitempty" jsonschema:"max seconds to wait (default 30)"`
+	LookbackSeconds int      `json:"lookback_seconds,omitempty" jsonschema:"check the recent-events buffer for a matching event that already arrived this many seconds ago (default 5). Set to 0 to wait only for new events."`
+}
+
+type waitForEventOutput struct {
+	Event    *baresip.RecordedEvent `json:"event"`
+	TimedOut bool                   `json:"timed_out"`
+}
+
 func main() {
 	accountsPath := flag.String("accounts", envOr("BARESIP_ACCOUNTS", defaultAccountsPath()), "path to a baresip accounts file (copied into the child baresip's tmpdir)")
 	bufSize := flag.Int("event-buffer", 256, "size of the recent-events ring buffer")
@@ -94,18 +106,20 @@ func main() {
 	defer client.Close()
 
 	events := baresip.NewEventBuffer(*bufSize)
+	fanout := baresip.NewEventFanout()
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "baresip-mcp",
 		Version: "0.1.0",
 	}, nil)
 
-	// Fan events out to the ring buffer (queryable via recent_events) and
-	// stderr. We don't push them as MCP resource updates / logging
-	// notifications because Claude Code, the primary client, ignores both.
+	// Fan events out to the ring buffer (recent_events), stderr, and the
+	// in-process fanout (wait_for_event). We don't push events via MCP
+	// notifications because Claude Code, the primary client, ignores them.
 	go func() {
 		for ev := range client.Events() {
 			events.Add(ev)
+			fanout.Publish(ev)
 			log.Printf("baresip event: class=%s type=%s param=%s", ev.Class, ev.Type, ev.Param)
 		}
 	}()
@@ -234,6 +248,11 @@ func main() {
 			Content: []mcp.Content{&mcp.TextContent{Text: string(body)}},
 		}, nil, nil
 	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "wait_for_event",
+		Description: "Block until a baresip event arrives matching the given filters, or until timeout. Use after dial/accept/hangup to observe call lifecycle without polling recent_events.",
+	}, waitForEventHandler(events, fanout))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "command",
@@ -398,6 +417,87 @@ func lookupUAIndex(ctx context.Context, c *baresip.Client, aor string) (int, err
 		}
 	}
 	return 0, fmt.Errorf("AOR %s not found in reginfo", aor)
+}
+
+func waitForEventHandler(buf *baresip.EventBuffer, fan *baresip.EventFanout) func(context.Context, *mcp.CallToolRequest, waitForEventInput) (*mcp.CallToolResult, waitForEventOutput, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in waitForEventInput) (*mcp.CallToolResult, waitForEventOutput, error) {
+		timeout := time.Duration(in.TimeoutSeconds) * time.Second
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		lookback := time.Duration(in.LookbackSeconds) * time.Second
+		if in.LookbackSeconds == 0 {
+			lookback = 5 * time.Second
+		}
+
+		matches := func(ev baresip.Event) bool {
+			if in.CallID != "" {
+				id, _ := ev.Extra["id"].(string)
+				if id != in.CallID {
+					return false
+				}
+			}
+			if len(in.Types) == 0 {
+				return true
+			}
+			for _, t := range in.Types {
+				if ev.Type == t {
+					return true
+				}
+			}
+			return false
+		}
+
+		// Subscribe first so we don't miss events that arrive while we're
+		// scanning the lookback buffer.
+		ch, unsub := fan.Subscribe()
+		defer unsub()
+
+		// Lookback: check the ring buffer for a matching event newer than
+		// (now - lookback).
+		if lookback > 0 {
+			cutoff := time.Now().Add(-lookback)
+			snap := buf.Snapshot(0)
+			for i := len(snap) - 1; i >= 0; i-- {
+				if snap[i].At.Before(cutoff) {
+					break
+				}
+				ev := baresip.Event{
+					Class: snap[i].Class,
+					Type:  snap[i].Type,
+					Param: snap[i].Param,
+					Extra: snap[i].Extra,
+				}
+				if matches(ev) {
+					rec := snap[i]
+					return &mcp.CallToolResult{}, waitForEventOutput{Event: &rec}, nil
+				}
+			}
+		}
+
+		wctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		for {
+			select {
+			case ev, ok := <-ch:
+				if !ok {
+					return &mcp.CallToolResult{}, waitForEventOutput{TimedOut: true}, nil
+				}
+				if matches(ev) {
+					rec := baresip.RecordedEvent{
+						At:    time.Now().UTC(),
+						Class: ev.Class,
+						Type:  ev.Type,
+						Param: ev.Param,
+						Extra: ev.Extra,
+					}
+					return &mcp.CallToolResult{}, waitForEventOutput{Event: &rec}, nil
+				}
+			case <-wctx.Done():
+				return &mcp.CallToolResult{}, waitForEventOutput{TimedOut: true}, nil
+			}
+		}
+	}
 }
 
 func runCmd(ctx context.Context, c *baresip.Client, cmd, params string) (*mcp.CallToolResult, any, error) {
