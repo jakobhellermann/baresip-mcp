@@ -31,9 +31,16 @@
       via the standard resources mechanism. Smoke test asserts
       resources/list and resources/read both work.
 
+- [x] **7. Dockerfile**
+      Two-stage build: golang:1.26 → debian-slim with baresip from apt
+      and the MCP binary at /usr/local/bin/baresip-mcp.
+- [x] **8. Smoke covers full tool surface**
+      tools/list is asserted against every declared tool name.
+
 ## Maybe next
 
-- More structured parsers (`callstat`, `uafind`).
-- Dockerfile / Nix flake for a one-shot run.
+- More structured parsers (`callstat` outputs multi-line debug text
+  that's brittle to parse — leave as raw via the `command` tool).
+- Nix flake (mirroring the Dockerfile for the nix-using crowd here).
 - End-to-end test that drives a real call (would need two baresip
   instances or a SIP test peer like sipp).

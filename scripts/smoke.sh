@@ -66,8 +66,9 @@ CALL1='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reginfo",
 CALL2='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_calls","arguments":{}}}'
 LIST_RES='{"jsonrpc":"2.0","id":4,"method":"resources/list"}'
 READ_RES='{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"baresip://events"}}'
+LIST_TOOLS='{"jsonrpc":"2.0","id":6,"method":"tools/list"}'
 
-OUT="$( { printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$INIT" "$INITED" "$CALL1" "$CALL2" "$LIST_RES" "$READ_RES"; sleep 1; } | \
+OUT="$( { printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$INIT" "$INITED" "$CALL1" "$CALL2" "$LIST_RES" "$READ_RES" "$LIST_TOOLS"; sleep 1; } | \
   "$WORK/baresip-mcp" -addr "127.0.0.1:$PORT" 2>"$WORK/mcp.log" || true )"
 
 echo "--- mcp stdout ---"
@@ -96,5 +97,11 @@ if ! grep -q '"uri":"baresip://events"' <<<"$OUT"; then
   echo "FAIL: events resource not listed/readable"
   exit 1
 fi
+for tool in dial accept hangup hangup_all list_calls call_status reginfo hold mute transfer dtmf uafind recent_events command; do
+  if ! grep -q "\"name\":\"$tool\"" <<<"$OUT"; then
+    echo "FAIL: tool '$tool' not advertised in tools/list"
+    exit 1
+  fi
+done
 
 echo "==> SMOKE OK"
