@@ -37,10 +37,17 @@
 - [x] **8. Smoke covers full tool surface**
       tools/list is asserted against every declared tool name.
 
+- [x] **9. End-to-end test with two real baresips**
+      `test/e2e/e2e_test.go` (build tag `e2e`) spawns two baresip
+      processes on loopback (no registrar / no provider), dials A→B
+      by URI, accepts on B, asserts the CALL_ESTABLISHED and
+      CALL_CLOSED events arrive on A's ctrl_tcp event stream.
+
 ## Maybe next
 
 - More structured parsers (`callstat` outputs multi-line debug text
   that's brittle to parse — leave as raw via the `command` tool).
 - Nix flake (mirroring the Dockerfile for the nix-using crowd here).
-- End-to-end test that drives a real call (would need two baresip
-  instances or a SIP test peer like sipp).
+- Run the e2e test in CI (needs `baresip` apt package on the runner;
+  the smoke job already installs it, so a single combined job would
+  cover both).
