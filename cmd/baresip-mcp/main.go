@@ -72,8 +72,9 @@ type acceptInput struct {
 }
 
 type registerInput struct {
-	AOR    string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
-	Regint int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 600). 0 means do not register."`
+	AOR              string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
+	Regint           int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 600). 0 means do not register."`
+	AutoAnswerAfter int    `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Internally sets ;answermode=auto;answerdelay=N on the account. Triggers a baresip respawn if one is already running."`
 }
 
 type unregisterInput struct {
@@ -202,8 +203,16 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "register",
-		Description: "Register an account at its provider so it can receive incoming calls. Pass regint=0 to stop registering.",
+		Description: "Register an account at its provider so it can receive incoming calls. Pass regint=0 to stop registering. Pass auto_answer_after_seconds>0 to enable delayed auto-answer (gives caller a ringback window).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, any, error) {
+		if in.AutoAnswerAfter > 0 {
+			if _, err := fleet.SetAccountAttrs(in.AOR, map[string]string{
+				"answermode":  "auto",
+				"answerdelay": fmt.Sprintf("%d", in.AutoAnswerAfter),
+			}); err != nil {
+				return nil, nil, err
+			}
+		}
 		regint := in.Regint
 		if regint == 0 {
 			regint = 600

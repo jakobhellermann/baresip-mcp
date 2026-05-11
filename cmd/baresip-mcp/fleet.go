@@ -207,6 +207,62 @@ func (f *Fleet) AccountAORs() []string {
 	return f.aorsLocked()
 }
 
+// SetAccountAttrs augments the stored account line for aor with the
+// given baresip URI parameters (overwriting any existing values for
+// those keys). If the baresip for that AOR is currently running, it is
+// killed; the next ClientFor will respawn with the new attrs. Returns
+// the new account line.
+//
+// The user's on-disk accounts file is never touched.
+func (f *Fleet) SetAccountAttrs(aor string, attrs map[string]string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	idx := -1
+	for i, a := range f.accounts {
+		if a.aor == aor {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return "", fmt.Errorf("unknown AOR %s", aor)
+	}
+	line := f.accounts[idx].line
+	for k, v := range attrs {
+		line = replaceOrAppendAccountParam(line, k, v)
+	}
+	f.accounts[idx].line = line
+
+	// Drop the running baresip so the next ClientFor respawns with the
+	// new attrs. Active calls on that baresip end abruptly — acceptable
+	// for a config change.
+	if c, ok := f.clients[aor]; ok {
+		_ = c.Close()
+		delete(f.clients, aor)
+	}
+	if inst, ok := f.insts[aor]; ok {
+		inst.Close()
+		delete(f.insts, aor)
+	}
+	return line, nil
+}
+
+// replaceOrAppendAccountParam replaces ;key=...; ... or appends ;key=value.
+func replaceOrAppendAccountParam(line, key, value string) string {
+	prefix := ";" + key + "="
+	i := strings.Index(line, prefix)
+	if i < 0 {
+		return line + prefix + value
+	}
+	start := i + len(prefix)
+	end := start
+	for end < len(line) && line[end] != ';' && line[end] != '?' {
+		end++
+	}
+	return line[:start] + value + line[end:]
+}
+
 // LiveClients returns clients for currently-spawned baresips only.
 // Used by aggregated tools (reginfo, list_calls) that should not force
 // every account to spawn just to read state.

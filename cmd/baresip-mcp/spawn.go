@@ -126,6 +126,17 @@ type spawnParams struct {
 	accountsLine string // single-account line; empty means baresip starts with zero UAs
 }
 
+// withAccountParam appends ";<key>=<value>" to a baresip account line if
+// that key isn't already present. Used by the fleet to inject defaults
+// like ;answermode=auto;answerdelay=2 without touching the user's
+// accounts file.
+func withAccountParam(line, key, value string) string {
+	if strings.Contains(line, ";"+key+"=") {
+		return line
+	}
+	return line + ";" + key + "=" + value
+}
+
 // spawnBaresip writes a self-contained config + accounts into a tmpdir,
 // starts baresip headless against it, waits until ctrl_tcp accepts
 // connections, and returns the loopback address it's listening on.
