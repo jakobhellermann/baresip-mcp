@@ -203,42 +203,18 @@ func main() {
 		Name:        "register",
 		Description: "Register a configured SIP account at its provider so it can receive incoming calls. Pass regint=0 to stop registering.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, any, error) {
-		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		resp, err := client.Do(cctx, "uafind", in.AOR)
-		cancel()
-		if err != nil {
-			return nil, nil, err
-		}
-		if !resp.OK {
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
-			}, nil, nil
-		}
 		regint := in.Regint
 		if regint == 0 {
 			regint = 600
 		}
-		return runCmd(ctx, client, "uareg", fmt.Sprintf("%d", regint))
+		return uaregByAOR(ctx, client, in.AOR, regint)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "unregister",
 		Description: "Deregister a SIP account (regint=0). The account stays loaded but is no longer reachable for incoming calls.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in unregisterInput) (*mcp.CallToolResult, any, error) {
-		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		resp, err := client.Do(cctx, "uafind", in.AOR)
-		cancel()
-		if err != nil {
-			return nil, nil, err
-		}
-		if !resp.OK {
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
-			}, nil, nil
-		}
-		return runCmd(ctx, client, "uareg", "0")
+		return uaregByAOR(ctx, client, in.AOR, 0)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -398,6 +374,22 @@ func dialHandler(ctx context.Context, c *baresip.Client, in dialInput) (*mcp.Cal
 	}
 
 	return dialResult, nil, dialErr
+}
+
+// uaregByAOR resolves an AOR to a UA index via reginfo, then runs uareg
+// with both the regint and explicit UA index. baresip's cmd_uareg uses
+// menu_ua_carg which requires two whitespace-separated words (regint and
+// index) when carg->data is NULL; without the index it returns NULL and
+// the handler silently no-ops.
+func uaregByAOR(ctx context.Context, c *baresip.Client, aor string, regint int) (*mcp.CallToolResult, any, error) {
+	idx, err := lookupUAIndex(ctx, c, aor)
+	if err != nil {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("resolve UA index for %s: %v", aor, err)}},
+		}, nil, nil
+	}
+	return runCmd(ctx, c, "uareg", fmt.Sprintf("%d %d", regint, idx))
 }
 
 func lookupUAIndex(ctx context.Context, c *baresip.Client, aor string) (int, error) {
