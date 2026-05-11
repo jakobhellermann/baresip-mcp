@@ -15,10 +15,19 @@
       returns both a text content block and `structuredContent` so clients
       can pick whichever shape they prefer.
 
+- [x] **4. Structured output for `reginfo`**
+      Parsed via `pkg/baresip.ParseRegInfo` into typed `Registration`
+      entries (aor, status OK/ERR/zzz, fallback flag, server, expires).
+
+- [x] **5. CI**
+      `.github/workflows/ci.yml` — go vet + go test -race on every push,
+      plus a separate job that installs baresip via apt and runs
+      `scripts/smoke.sh` against the freshly-built MCP binary.
+
 ## Maybe next
 
-- Structured output for `reginfo`. Format is per-line and a bit lossy
-  (`reg_status` in `src/reg.c`); leaving as raw text until needed.
-- CI: GitHub Actions running `go test ./...` and `scripts/smoke.sh`
-  (smoke needs baresip on the runner — easy on linux via apt).
-- Resource-based event stream (`baresip://events`) with subscribe.
+- Resource-based event stream (`baresip://events`) with subscribe so
+  clients get push notifications via the standard resources mechanism
+  instead of (or in addition to) logging messages.
+- More structured parsers (`callstat`, `uafind`).
+- Dockerfile / Nix flake for a one-shot run.

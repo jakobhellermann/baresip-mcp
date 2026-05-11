@@ -5,6 +5,9 @@ import (
 	"strings"
 )
 
+// ansiEscapeRE strips terminal color escapes that baresip embeds in reg output.
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+
 // Call is a parsed entry from the "listcalls" command output.
 type Call struct {
 	Line     int    `json:"line"`
@@ -58,6 +61,50 @@ func ParseListCalls(s string) []UserAgentCalls {
 				PeerURI:  m[7],
 			})
 		}
+	}
+	return out
+}
+
+// Registration is a parsed entry from the "reginfo" command output.
+type Registration struct {
+	Index    int    `json:"index"`
+	AOR      string `json:"aor"`
+	Status   string `json:"status"`            // "OK", "ERR", "zzz" (idle/initial), or "" if unparseable
+	Fallback bool   `json:"fallback"`          // true if the registration is using the fallback server
+	Server   string `json:"server,omitempty"`  // SIP server URI
+	Expires  int    `json:"expires,omitempty"` // seconds; 0 if not present
+}
+
+// regLineRE matches one line of ua_print_status + reg_status output, e.g.:
+//   "0 - sip:alice@example.com    OK  sip:srv.example.com  Expires 60s"
+//   "1 - sip:bob@example.com      FB-ERR sip:fallback.example.com"
+//   "0 - sip:carol@example.com    zzz"
+// After ANSI stripping, the status token is one of: OK, ERR, zzz, optionally
+// prefixed with "FB-" for fallback.
+var regLineRE = regexp.MustCompile(
+	`^(\d+)\s+-\s+(\S+)\s+(FB-)?(OK|ERR|zzz)(?:\s+(\S+))?(?:\s+Expires\s+(\d+)s)?\s*$`)
+
+// ParseRegInfo parses the textual response of baresip's "reginfo" command.
+// Lines that don't match the expected layout are skipped.
+func ParseRegInfo(s string) []Registration {
+	var out []Registration
+	clean := ansiEscapeRE.ReplaceAllString(s, "")
+	for _, line := range strings.Split(clean, "\n") {
+		line = strings.TrimRight(line, " \t")
+		// Collapse runs of whitespace so the regex stays simple.
+		line = strings.Join(strings.Fields(line), " ")
+		m := regLineRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		out = append(out, Registration{
+			Index:    atoi(m[1]),
+			AOR:      m[2],
+			Fallback: m[3] == "FB-",
+			Status:   m[4],
+			Server:   m[5],
+			Expires:  atoi(m[6]),
+		})
 	}
 	return out
 }

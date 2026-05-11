@@ -135,10 +135,8 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "reginfo",
-		Description: "Show registration status of all configured SIP accounts.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "reginfo", "")
-	})
+		Description: "Show registration status of all configured SIP accounts. Returns structured per-AOR registration state.",
+	}, reginfoHandler(client))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "hold",
@@ -230,6 +228,30 @@ func listCallsHandler(c *baresip.Client) func(context.Context, *mcp.CallToolRequ
 		out := listCallsOutput{
 			UserAgents: baresip.ParseListCalls(resp.Data),
 			Raw:        resp.Data,
+		}
+		return &mcp.CallToolResult{
+			IsError: !resp.OK,
+			Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
+		}, out, nil
+	}
+}
+
+type reginfoOutput struct {
+	Registrations []baresip.Registration `json:"registrations"`
+	Raw           string                 `json:"raw"`
+}
+
+func reginfoHandler(c *baresip.Client) func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, reginfoOutput, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, reginfoOutput, error) {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		resp, err := c.Do(cctx, "reginfo", "")
+		if err != nil {
+			return nil, reginfoOutput{}, err
+		}
+		out := reginfoOutput{
+			Registrations: baresip.ParseRegInfo(resp.Data),
+			Raw:           resp.Data,
 		}
 		return &mcp.CallToolResult{
 			IsError: !resp.OK,

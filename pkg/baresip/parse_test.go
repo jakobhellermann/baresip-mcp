@@ -12,6 +12,33 @@ func TestParseListCallsEmpty(t *testing.T) {
 	}
 }
 
+func TestParseRegInfo(t *testing.T) {
+	// Reproduce the literal escape sequences baresip emits via print_scode.
+	esc := "\x1b[32m" // green
+	rst := "\x1b[;m"
+	input := "\n--- User Agents (3) ---\n" +
+		"0 - sip:alice@example.com                  " + esc + "OK " + rst + " sip:srv.example.com Expires 60s\n" +
+		"1 - sip:bob@example.com                    FB-\x1b[31mERR\x1b[;m sip:fb.example.com\n" +
+		"2 - sip:carol@example.com                  \x1b[33mzzz\x1b[;m\n" +
+		"\n"
+
+	got := ParseRegInfo(input)
+	want := []Registration{
+		{Index: 0, AOR: "sip:alice@example.com", Status: "OK", Server: "sip:srv.example.com", Expires: 60},
+		{Index: 1, AOR: "sip:bob@example.com", Status: "ERR", Fallback: true, Server: "sip:fb.example.com"},
+		{Index: 2, AOR: "sip:carol@example.com", Status: "zzz"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestParseRegInfoEmpty(t *testing.T) {
+	if got := ParseRegInfo("\n--- User Agents (0) ---\n\n"); got != nil {
+		t.Fatalf("expected nil, got %#v", got)
+	}
+}
+
 func TestParseListCallsSingleUA(t *testing.T) {
 	// Mirrors the exact format produced by ua_print_calls + call_info:
 	// "%-42s" is not in listcalls; per-call lines come from call_info.

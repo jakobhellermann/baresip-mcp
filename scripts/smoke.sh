@@ -19,7 +19,7 @@ mkdir -p "$WORK/.baresip"
 # Locate the modules directory (brew installs to /opt/homebrew/...).
 MODPATH="${BARESIP_MODPATH:-}"
 if [[ -z "$MODPATH" ]]; then
-  for cand in /opt/homebrew/lib/baresip/modules /usr/local/lib/baresip/modules /usr/lib/baresip/modules; do
+  for cand in /opt/homebrew/lib/baresip/modules /usr/local/lib/baresip/modules /usr/lib/x86_64-linux-gnu/baresip/modules /usr/lib/aarch64-linux-gnu/baresip/modules /usr/lib/baresip/modules; do
     if [[ -f "$cand/ctrl_tcp.so" ]]; then MODPATH="$cand"; break; fi
   done
 fi

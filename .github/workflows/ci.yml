@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+  smoke:
+    name: live baresip smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: install baresip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends baresip netcat-openbsd
+          baresip -v || true
+
+      - name: locate baresip modules
+        id: modpath
+        run: |
+          for cand in /usr/lib/x86_64-linux-gnu/baresip/modules /usr/lib/baresip/modules; do
+            if [ -f "$cand/ctrl_tcp.so" ]; then
+              echo "modpath=$cand" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "ctrl_tcp.so not found in known baresip module paths" >&2
+          exit 1
+
+      - name: smoke test
+        env:
+          BARESIP_MODPATH: ${{ steps.modpath.outputs.modpath }}
+        run: ./scripts/smoke.sh
