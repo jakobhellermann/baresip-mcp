@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -38,66 +39,80 @@ type Event struct {
 	Raw   json.RawMessage
 }
 
+var ErrDisconnected = errors.New("baresip: not connected")
+
 type Client struct {
 	addr   string
 	dialer net.Dialer
+	logger *log.Logger
 
 	mu      sync.Mutex
 	conn    net.Conn
-	br      *bufio.Reader
 	pending map[string]chan Response
-	events  chan Event
-	closed  bool
-	done    chan struct{}
+
+	events chan Event
+
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	doneCh    chan struct{}
 }
 
-func New(addr string) *Client {
-	return &Client{
+type Option func(*Client)
+
+func WithLogger(l *log.Logger) Option {
+	return func(c *Client) { c.logger = l }
+}
+
+func New(addr string, opts ...Option) *Client {
+	c := &Client{
 		addr:    addr,
 		dialer:  net.Dialer{Timeout: 5 * time.Second},
+		logger:  log.New(log.Writer(), "baresip: ", log.LstdFlags),
 		pending: make(map[string]chan Response),
 		events:  make(chan Event, 64),
-		done:    make(chan struct{}),
+		closeCh: make(chan struct{}),
+		doneCh:  make(chan struct{}),
 	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
-// Connect dials baresip. Must be called before Do.
+// Connect dials baresip and starts the supervisor goroutine that
+// reconnects with backoff on disconnect.
+// The first dial is synchronous; if it fails, Connect returns the error
+// and the supervisor does not start.
 func (c *Client) Connect(ctx context.Context) error {
 	conn, err := c.dialer.DialContext(ctx, "tcp", c.addr)
 	if err != nil {
 		return fmt.Errorf("dial baresip ctrl_tcp at %s: %w", c.addr, err)
 	}
-	c.mu.Lock()
-	c.conn = conn
-	c.br = bufio.NewReader(conn)
-	c.mu.Unlock()
-	go c.readLoop()
+	c.setConn(conn)
+	go c.supervise()
 	return nil
 }
 
+// Close shuts the client down and waits for the supervisor to exit.
 func (c *Client) Close() error {
-	c.mu.Lock()
-	if c.closed {
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
+		c.mu.Lock()
+		conn := c.conn
 		c.mu.Unlock()
-		return nil
-	}
-	c.closed = true
-	conn := c.conn
-	c.mu.Unlock()
-	if conn != nil {
-		_ = conn.Close()
-	}
-	<-c.done
+		if conn != nil {
+			_ = conn.Close()
+		}
+	})
+	<-c.doneCh
 	return nil
 }
 
-// Events returns a channel of asynchronous events from baresip.
-// The channel is closed when the client is closed.
-func (c *Client) Events() <-chan Event {
-	return c.events
-}
+// Events returns a channel of asynchronous events. Closed when the client is closed.
+func (c *Client) Events() <-chan Event { return c.events }
 
 // Do sends a command and waits for the matching response.
+// If currently disconnected, returns ErrDisconnected.
 func (c *Client) Do(ctx context.Context, command, params string) (Response, error) {
 	tok, err := randomToken()
 	if err != nil {
@@ -106,12 +121,12 @@ func (c *Client) Do(ctx context.Context, command, params string) (Response, erro
 	ch := make(chan Response, 1)
 
 	c.mu.Lock()
-	if c.closed || c.conn == nil {
+	if c.conn == nil {
 		c.mu.Unlock()
-		return Response{}, errors.New("baresip: client not connected")
+		return Response{}, ErrDisconnected
 	}
-	c.pending[tok] = ch
 	conn := c.conn
+	c.pending[tok] = ch
 	c.mu.Unlock()
 
 	defer func() {
@@ -133,33 +148,94 @@ func (c *Client) Do(ctx context.Context, command, params string) (Response, erro
 	}
 
 	select {
-	case resp := <-ch:
+	case resp, ok := <-ch:
+		if !ok {
+			return Response{}, ErrDisconnected
+		}
 		return resp, nil
 	case <-ctx.Done():
 		return Response{}, ctx.Err()
-	case <-c.done:
-		return Response{}, errors.New("baresip: connection closed")
+	case <-c.closeCh:
+		return Response{}, errors.New("baresip: client closed")
+	}
+}
+
+func (c *Client) setConn(conn net.Conn) {
+	c.mu.Lock()
+	c.conn = conn
+	c.mu.Unlock()
+}
+
+// dropConn clears the current connection and fails pending requests.
+func (c *Client) dropConn() {
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	pending := c.pending
+	c.pending = make(map[string]chan Response)
+	c.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+	for _, ch := range pending {
+		close(ch)
+	}
+}
+
+func (c *Client) supervise() {
+	defer close(c.doneCh)
+	defer close(c.events)
+
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	for {
+		c.readLoop() // returns when connection drops
+		c.dropConn()
+
+		select {
+		case <-c.closeCh:
+			return
+		default:
+		}
+
+		c.logger.Printf("disconnected; reconnecting in %s", backoff)
+		select {
+		case <-time.After(backoff):
+		case <-c.closeCh:
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := c.dialer.DialContext(ctx, "tcp", c.addr)
+		cancel()
+		if err != nil {
+			c.logger.Printf("reconnect failed: %v", err)
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
+		c.logger.Printf("reconnected to %s", c.addr)
+		c.setConn(conn)
+		backoff = time.Second
 	}
 }
 
 func (c *Client) readLoop() {
-	defer close(c.done)
-	defer close(c.events)
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	br := bufio.NewReader(conn)
 	for {
-		c.mu.Lock()
-		br := c.br
-		c.mu.Unlock()
-		if br == nil {
-			return
-		}
 		buf, err := readNetstring(br)
 		if err != nil {
-			c.mu.Lock()
-			for _, ch := range c.pending {
-				close(ch)
-			}
-			c.pending = map[string]chan Response{}
-			c.mu.Unlock()
 			return
 		}
 		c.dispatch(buf)
@@ -167,8 +243,6 @@ func (c *Client) readLoop() {
 }
 
 func (c *Client) dispatch(buf []byte) {
-	// Peek at the message type. Responses have "response": true,
-	// events have "event": true, SIP messages have "message": true.
 	var probe struct {
 		Response bool `json:"response"`
 		Event    bool `json:"event"`
@@ -204,7 +278,7 @@ func (c *Client) dispatch(buf []byte) {
 		select {
 		case c.events <- ev:
 		default:
-			// Drop if consumer is slow; events are best-effort.
+			// Best-effort: drop if the consumer is slow.
 		}
 	}
 }
