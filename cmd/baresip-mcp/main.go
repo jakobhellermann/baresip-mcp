@@ -19,8 +19,6 @@ import (
 	"github.com/sipgate/baresip-mcp/pkg/baresip"
 )
 
-const eventsResourceURI = "baresip://events"
-
 type dialInput struct {
 	URI     string            `json:"uri" jsonschema:"SIP URI to dial, e.g. sip:alice@example.com"`
 	From    string            `json:"from,omitempty" jsonschema:"optional AOR of the local account to call from, e.g. sip:1126226e1@proxy.dev.sipgate.de. If omitted, baresip picks a matching UA by URI host."`
@@ -97,36 +95,18 @@ func main() {
 
 	events := baresip.NewEventBuffer(*bufSize)
 
-	// Non-nil subscribe handlers cause the SDK to advertise the
-	// resources.subscribe capability. The SDK itself tracks which
-	// sessions are subscribed; ResourceUpdated honors that internally.
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "baresip-mcp",
 		Version: "0.1.0",
-	}, &mcp.ServerOptions{
-		SubscribeHandler:   func(context.Context, *mcp.SubscribeRequest) error { return nil },
-		UnsubscribeHandler: func(context.Context, *mcp.UnsubscribeRequest) error { return nil },
-	})
+	}, nil)
 
-	server.AddResource(&mcp.Resource{
-		URI:         eventsResourceURI,
-		Name:        "baresip events",
-		Description: "Ring buffer of recent asynchronous events emitted by baresip. Subscribe for push notifications.",
-		MIMEType:    "application/json",
-	}, eventsResourceHandler(events))
-
-	// Fan events out to: ring buffer (queryable via recent_events and
-	// the baresip://events resource), stderr log, logging/message
-	// notifications to every connected session, and a resource-updated
-	// notification so resource subscribers are pinged.
+	// Fan events out to the ring buffer (queryable via recent_events) and
+	// stderr. We don't push them as MCP resource updates / logging
+	// notifications because Claude Code, the primary client, ignores both.
 	go func() {
 		for ev := range client.Events() {
 			events.Add(ev)
 			log.Printf("baresip event: class=%s type=%s param=%s", ev.Class, ev.Type, ev.Param)
-			notifyEvent(server, ev)
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: eventsResourceURI})
-			cancel()
 		}
 	}()
 
@@ -457,41 +437,6 @@ func runCmd(ctx context.Context, c *baresip.Client, cmd, params string) (*mcp.Ca
 		IsError: !resp.OK,
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
-}
-
-func eventsResourceHandler(buf *baresip.EventBuffer) mcp.ResourceHandler {
-	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-		body, err := json.MarshalIndent(buf.Snapshot(0), "", "  ")
-		if err != nil {
-			return nil, err
-		}
-		return &mcp.ReadResourceResult{
-			Contents: []*mcp.ResourceContents{{
-				URI:      req.Params.URI,
-				MIMEType: "application/json",
-				Text:     string(body),
-			}},
-		}, nil
-	}
-}
-
-func notifyEvent(server *mcp.Server, ev baresip.Event) {
-	params := &mcp.LoggingMessageParams{
-		Level:  "info",
-		Logger: "baresip",
-		Data: map[string]any{
-			"class": ev.Class,
-			"type":  ev.Type,
-			"param": ev.Param,
-			"extra": ev.Extra,
-		},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	for session := range server.Sessions() {
-		// Best-effort: a slow or dead client must not block the event pump.
-		_ = session.Log(ctx, params)
-	}
 }
 
 func defaultAccountsPath() string {
