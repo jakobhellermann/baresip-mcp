@@ -59,3 +59,8 @@ jobs:
         env:
           BARESIP_MODPATH: ${{ steps.modpath.outputs.modpath }}
         run: ./scripts/smoke.sh
+
+      - name: e2e test (two baresip processes)
+        env:
+          BARESIP_MODPATH: ${{ steps.modpath.outputs.modpath }}
+        run: go test -tags e2e -count=1 -timeout 60s ./test/e2e/ -v
