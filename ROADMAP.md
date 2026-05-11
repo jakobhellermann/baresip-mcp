@@ -24,10 +24,16 @@
       plus a separate job that installs baresip via apt and runs
       `scripts/smoke.sh` against the freshly-built MCP binary.
 
+- [x] **6. Resource-based event stream**
+      `baresip://events` MCP resource. ResourceHandler returns the
+      ring buffer as JSON. Each incoming baresip event fires
+      `ResourceUpdated` so subscribed clients get push notifications
+      via the standard resources mechanism. Smoke test asserts
+      resources/list and resources/read both work.
+
 ## Maybe next
 
-- Resource-based event stream (`baresip://events`) with subscribe so
-  clients get push notifications via the standard resources mechanism
-  instead of (or in addition to) logging messages.
 - More structured parsers (`callstat`, `uafind`).
 - Dockerfile / Nix flake for a one-shot run.
+- End-to-end test that drives a real call (would need two baresip
+  instances or a SIP test peer like sipp).

@@ -64,8 +64,10 @@ INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 INITED='{"jsonrpc":"2.0","method":"notifications/initialized"}'
 CALL1='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reginfo","arguments":{}}}'
 CALL2='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_calls","arguments":{}}}'
+LIST_RES='{"jsonrpc":"2.0","id":4,"method":"resources/list"}'
+READ_RES='{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"baresip://events"}}'
 
-OUT="$( { printf '%s\n%s\n%s\n%s\n' "$INIT" "$INITED" "$CALL1" "$CALL2"; sleep 1; } | \
+OUT="$( { printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$INIT" "$INITED" "$CALL1" "$CALL2" "$LIST_RES" "$READ_RES"; sleep 1; } | \
   "$WORK/baresip-mcp" -addr "127.0.0.1:$PORT" 2>"$WORK/mcp.log" || true )"
 
 echo "--- mcp stdout ---"
@@ -88,6 +90,10 @@ if ! grep -q '"id":3' <<<"$OUT"; then
 fi
 if ! grep -q '"user_agents"' <<<"$OUT"; then
   echo "FAIL: list_calls did not return structured output"
+  exit 1
+fi
+if ! grep -q '"uri":"baresip://events"' <<<"$OUT"; then
+  echo "FAIL: events resource not listed/readable"
   exit 1
 fi
 

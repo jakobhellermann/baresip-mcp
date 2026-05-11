@@ -51,7 +51,8 @@ func (b *EventBuffer) Add(ev Event) {
 func (b *EventBuffer) Snapshot(limit int) []RecordedEvent {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var ordered []RecordedEvent
+	// Always return a non-nil slice so JSON encoders emit [] rather than null.
+	ordered := make([]RecordedEvent, 0, b.cap)
 	if b.full {
 		ordered = append(ordered, b.buf[b.next:]...)
 		ordered = append(ordered, b.buf[:b.next]...)

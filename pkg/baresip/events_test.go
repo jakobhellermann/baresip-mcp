@@ -36,7 +36,11 @@ func TestEventBufferLimit(t *testing.T) {
 
 func TestEventBufferEmpty(t *testing.T) {
 	b := NewEventBuffer(4)
-	if got := b.Snapshot(0); len(got) != 0 {
+	got := b.Snapshot(0)
+	if len(got) != 0 {
 		t.Fatalf("expected empty snapshot, got %d", len(got))
+	}
+	if got == nil {
+		t.Fatal("Snapshot should never return nil; clients rely on JSON [] instead of null")
 	}
 }
