@@ -295,40 +295,19 @@ func reginfoHandler(c *baresip.Client) func(context.Context, *mcp.CallToolReques
 	}
 }
 
-// dialHandler implements per-call custom headers without a race: baresip
-// copies ua->custom_hdrs into the call at call-alloc time (see ua.c
-// ua_call_alloc → call_set_custom_hdrs), so removing them on the UA right
-// after dial leaves the active call's headers intact while keeping the UA
-// clean for subsequent calls.
+// dialHandler implements 'from' selection and per-call custom headers
+// without a race. baresip's commands invoked through ctrl_tcp go through
+// menu_ua_carg, which requires an explicit UA index — uafind alone is
+// not honored. So when 'from' is given we resolve the AOR to its index
+// via reginfo and pass it to dial / uaaddheader / uarmheader.
 //
-// baresip's uaaddheader / uarmheader require a UA index as the second
-// argument when invoked via ctrl_tcp (menu_ua_carg insists on two
-// whitespace-separated words). We resolve the AOR to an index by parsing
-// reginfo. Headers therefore require a 'from' AOR.
+// Headers are race-free because baresip copies ua->custom_hdrs into the
+// call at call_alloc time (ua.c ua_call_alloc → call_set_custom_hdrs).
+// Removing them on the UA right after dial leaves the active call
+// intact while keeping the UA clean for subsequent calls.
 func dialHandler(ctx context.Context, c *baresip.Client, in dialInput) (*mcp.CallToolResult, any, error) {
-	if in.From != "" {
-		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		resp, err := c.Do(cctx, "uafind", in.From)
-		cancel()
-		if err != nil {
-			return nil, nil, err
-		}
-		if !resp.OK {
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
-			}, nil, nil
-		}
-	}
-
 	uaIdx := -1
-	if len(in.Headers) > 0 {
-		if in.From == "" {
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{Text: "headers require 'from' so the UA index can be resolved"}},
-			}, nil, nil
-		}
+	if in.From != "" {
 		idx, err := lookupUAIndex(ctx, c, in.From)
 		if err != nil {
 			return &mcp.CallToolResult{
@@ -337,6 +316,13 @@ func dialHandler(ctx context.Context, c *baresip.Client, in dialInput) (*mcp.Cal
 			}, nil, nil
 		}
 		uaIdx = idx
+	}
+
+	if len(in.Headers) > 0 && uaIdx < 0 {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: "headers require 'from' so the UA index can be resolved"}},
+		}, nil, nil
 	}
 
 	keys := make([]string, 0, len(in.Headers))
@@ -362,7 +348,11 @@ func dialHandler(ctx context.Context, c *baresip.Client, in dialInput) (*mcp.Cal
 		}
 	}
 
-	dialResult, _, dialErr := runCmd(ctx, c, "dial", in.URI)
+	dialArg := in.URI
+	if uaIdx >= 0 {
+		dialArg = fmt.Sprintf("%s %d", in.URI, uaIdx)
+	}
+	dialResult, _, dialErr := runCmd(ctx, c, "dial", dialArg)
 
 	// Clean up headers from the UA regardless of dial outcome. The active
 	// call (if dial succeeded) keeps them because baresip copied them at
