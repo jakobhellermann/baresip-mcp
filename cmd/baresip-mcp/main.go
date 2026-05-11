@@ -1,4 +1,9 @@
 // Command baresip-mcp exposes a baresip ctrl_tcp connection as an MCP server.
+//
+// Each account in ~/.baresip/accounts gets its own baresip child process
+// so calls between two local accounts (e1 → e2 by external number) work
+// — sipgate's hairpinned INVITE arrives at a different SIP socket than
+// the outgoing leg, avoiding state-machine collisions.
 package main
 
 import (
@@ -11,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,8 +27,8 @@ import (
 
 type dialInput struct {
 	URI     string            `json:"uri" jsonschema:"SIP URI to dial, e.g. sip:alice@example.com"`
-	From    string            `json:"from,omitempty" jsonschema:"optional AOR of the local account to call from, e.g. sip:1126226e1@proxy.dev.sipgate.de. If omitted, baresip picks a matching UA by URI host."`
-	Headers map[string]string `json:"headers,omitempty" jsonschema:"optional SIP headers to attach to this specific outgoing INVITE, e.g. {\"X-Client-Correlation-ID\": \"abc-123\"}. Headers are scoped to this call only — they're set on the UA before dial, copied into the call by baresip, then removed from the UA."`
+	From    string            `json:"from" jsonschema:"AOR of the local account to call from, e.g. sip:1126226e1@proxy.dev.sipgate.de. Selects which baresip instance dials."`
+	Headers map[string]string `json:"headers,omitempty" jsonschema:"optional SIP headers to attach to this specific outgoing INVITE, e.g. {\"X-Client-Correlation-ID\": \"abc-123\"}. Headers are scoped to this call only — set on the UA before dial, copied into the call by baresip, then removed."`
 }
 
 type empty struct{}
@@ -30,30 +36,39 @@ type empty struct{}
 type rawInput struct {
 	Command string `json:"command" jsonschema:"baresip long-form command name, e.g. dial, hangup, reginfo"`
 	Params  string `json:"params,omitempty" jsonschema:"optional parameters appended to the command"`
+	AOR     string `json:"aor,omitempty" jsonschema:"optional AOR — routes the command to the baresip instance hosting that account. If omitted, the command is sent to every instance and the first non-error response wins."`
 }
 
 type transferInput struct {
-	URI string `json:"uri" jsonschema:"target SIP URI to blind-transfer the current call to"`
+	URI    string `json:"uri" jsonschema:"target SIP URI to blind-transfer the current call to"`
+	CallID string `json:"call_id,omitempty" jsonschema:"call id of the call to transfer; if omitted, sent to every instance"`
 }
 
 type dtmfInput struct {
 	Digits string `json:"digits" jsonschema:"DTMF digits to send to the active call, e.g. 1234#"`
+	CallID string `json:"call_id,omitempty" jsonschema:"call id; if omitted, sent to every instance"`
 }
 
 type muteInput struct {
-	On bool `json:"on" jsonschema:"true to mute, false to un-mute the active call"`
+	On     bool   `json:"on" jsonschema:"true to mute, false to un-mute the active call"`
+	CallID string `json:"call_id,omitempty" jsonschema:"call id; if omitted, sent to every instance"`
 }
 
 type holdInput struct {
-	On bool `json:"on" jsonschema:"true to put the active call on hold, false to resume"`
+	On     bool   `json:"on" jsonschema:"true to put the active call on hold, false to resume"`
+	CallID string `json:"call_id,omitempty" jsonschema:"call id; if omitted, sent to every instance"`
 }
 
 type hangupAllInput struct {
 	Direction string `json:"direction,omitempty" jsonschema:"optional filter: 'in' or 'out'. Empty hangs up all calls."`
 }
 
-type uafindInput struct {
-	AOR string `json:"aor" jsonschema:"address-of-record to look up, e.g. sip:alice@example.com"`
+type hangupInput struct {
+	CallID string `json:"call_id,omitempty" jsonschema:"call id of the call to hang up; if omitted, broadcast to every instance"`
+}
+
+type acceptInput struct {
+	AOR string `json:"aor,omitempty" jsonschema:"optional AOR of the instance whose ringing call to accept; if omitted, broadcast to every instance (only one will have a ringing call)"`
 }
 
 type registerInput struct {
@@ -72,8 +87,9 @@ type recentEventsInput struct {
 type waitForEventInput struct {
 	Types           []string `json:"types,omitempty" jsonschema:"event types to match (e.g. CALL_ESTABLISHED, CALL_CLOSED). Empty matches any event."`
 	CallID          string   `json:"call_id,omitempty" jsonschema:"optional baresip call id to filter on. If set, only events for that call match."`
+	AOR             string   `json:"aor,omitempty" jsonschema:"optional AOR to filter on. If set, only events from that account's baresip match."`
 	TimeoutSeconds  int      `json:"timeout_seconds,omitempty" jsonschema:"max seconds to wait (default 30)"`
-	LookbackSeconds int      `json:"lookback_seconds,omitempty" jsonschema:"check the recent-events buffer for a matching event that already arrived this many seconds ago (default 30). Set to -1 to disable lookback and only wait for new events."`
+	LookbackSeconds int      `json:"lookback_seconds,omitempty" jsonschema:"check the recent-events buffer for a matching event that already arrived this many seconds ago (default 30). Set to -1 to disable lookback."`
 }
 
 type waitForEventOutput struct {
@@ -82,157 +98,124 @@ type waitForEventOutput struct {
 }
 
 func main() {
-	accountsPath := flag.String("accounts", envOr("BARESIP_ACCOUNTS", defaultAccountsPath()), "path to a baresip accounts file (copied into the child baresip's tmpdir)")
+	accountsPath := flag.String("accounts", envOr("BARESIP_ACCOUNTS", defaultAccountsPath()), "path to a baresip accounts file; one baresip child is spawned per active line")
 	bufSize := flag.Int("event-buffer", 256, "size of the recent-events ring buffer")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Take out any baresips left over from previous MCP instances that
-	// died without running their defer (Claude Code SIGKILL on reload).
 	sweepOrphans()
 
-	instance, err := spawnBaresip(*accountsPath)
+	fleet, err := NewFleet(ctx, *accountsPath, *bufSize)
 	if err != nil {
-		log.Fatalf("spawn baresip: %v", err)
+		log.Fatalf("start fleet: %v", err)
 	}
-	defer instance.Close()
-	log.Printf("spawned baresip ctrl_tcp=%s tmpdir=%s log=%s", instance.addr, instance.tmpDir, instance.logPath)
-
-	client := baresip.New(instance.addr)
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	if err := client.Connect(dialCtx); err != nil {
-		cancel()
-		log.Fatalf("connect spawned baresip at %s: %v", instance.addr, err)
-	}
-	cancel()
-	defer client.Close()
-
-	events := baresip.NewEventBuffer(*bufSize)
-	fanout := baresip.NewEventFanout()
+	defer fleet.Close()
+	log.Printf("fleet ready with %d account(s): %v", len(fleet.AccountAORs()), fleet.AccountAORs())
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "baresip-mcp",
 		Version: "0.1.0",
 	}, nil)
 
-	// Fan events out to the ring buffer (recent_events), stderr, and the
-	// in-process fanout (wait_for_event). We don't push events via MCP
-	// notifications because Claude Code, the primary client, ignores them.
-	go func() {
-		for ev := range client.Events() {
-			events.Add(ev)
-			fanout.Publish(ev)
-			log.Printf("baresip event: class=%s type=%s param=%s", ev.Class, ev.Type, ev.Param)
-		}
-	}()
-
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "dial",
-		Description: "Place an outgoing SIP call to the given URI via baresip. Pass 'from' to pick a specific local account as the caller. Pass 'headers' to attach custom SIP headers to this specific INVITE.",
+		Description: "Place an outgoing SIP call to the given URI via baresip. 'from' selects which local account dials. 'headers' attaches per-call SIP headers (e.g. X-Client-Correlation-ID).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dialInput) (*mcp.CallToolResult, any, error) {
-		return dialHandler(ctx, client, in)
+		return dialHandler(ctx, fleet, in)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "accept",
-		Description: "Accept (answer) the currently ringing incoming call.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "accept", "")
+		Description: "Accept (answer) a ringing incoming call. Optionally scoped to one account by AOR.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in acceptInput) (*mcp.CallToolResult, any, error) {
+		return broadcastOrTargeted(ctx, fleet, in.AOR, "", "accept", "")
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "hangup",
-		Description: "Hang up the current call.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "hangup", "")
+		Description: "Hang up the current call. Optionally scoped to one call by call_id.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in hangupInput) (*mcp.CallToolResult, any, error) {
+		return broadcastOrTargeted(ctx, fleet, "", in.CallID, "hangup", "")
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "hangup_all",
-		Description: "Hang up all active calls, optionally filtered by direction ('in' or 'out').",
+		Description: "Hang up all active calls across every instance, optionally filtered by direction ('in' or 'out').",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in hangupAllInput) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "hangupall", in.Direction)
+		return broadcast(ctx, fleet, "hangupall", in.Direction)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_calls",
-		Description: "List all active calls. Returns structured per-UA call details.",
-	}, listCallsHandler(client))
+		Description: "List all active calls across every account.",
+	}, listCallsHandler(fleet))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "call_status",
-		Description: "Show status of the currently active call.",
+		Description: "Show status of the currently active call across every instance.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "callstat", "")
+		return broadcast(ctx, fleet, "callstat", "")
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "reginfo",
-		Description: "Show registration status of all configured SIP accounts. Returns structured per-AOR registration state.",
-	}, reginfoHandler(client))
+		Description: "Show registration status of all configured SIP accounts across every instance.",
+	}, reginfoHandler(fleet))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "hold",
-		Description: "Put the active call on hold or resume it.",
+		Description: "Hold or resume a call. Optionally scoped to one call by call_id.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in holdInput) (*mcp.CallToolResult, any, error) {
-		// baresip's "hold" command toggles; we map on/off explicitly.
 		cmd := "hold"
 		if !in.On {
 			cmd = "resume"
 		}
-		return runCmd(ctx, client, cmd, "")
+		return broadcastOrTargeted(ctx, fleet, "", in.CallID, cmd, "")
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "mute",
-		Description: "Mute or un-mute the active call.",
+		Description: "Mute or un-mute a call. Optionally scoped to one call by call_id.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in muteInput) (*mcp.CallToolResult, any, error) {
 		val := "false"
 		if in.On {
 			val = "true"
 		}
-		return runCmd(ctx, client, "mute", val)
+		return broadcastOrTargeted(ctx, fleet, "", in.CallID, "mute", val)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "transfer",
-		Description: "Blind-transfer the active call to the given SIP URI.",
+		Description: "Blind-transfer a call to the given SIP URI.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in transferInput) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "transfer", in.URI)
+		return broadcastOrTargeted(ctx, fleet, "", in.CallID, "transfer", in.URI)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "dtmf",
-		Description: "Send DTMF digits to the active call.",
+		Description: "Send DTMF digits to a call.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dtmfInput) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "sndcode", in.Digits)
-	})
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "uafind",
-		Description: "Find a configured User-Agent by address-of-record and make it the current one.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in uafindInput) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, "uafind", in.AOR)
+		return broadcastOrTargeted(ctx, fleet, "", in.CallID, "sndcode", in.Digits)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "register",
-		Description: "Register a configured SIP account at its provider so it can receive incoming calls. Pass regint=0 to stop registering.",
+		Description: "Register an account at its provider so it can receive incoming calls. Pass regint=0 to stop registering.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, any, error) {
 		regint := in.Regint
 		if regint == 0 {
 			regint = 600
 		}
-		return uaregByAOR(ctx, client, in.AOR, regint)
+		return uaregOn(ctx, fleet, in.AOR, regint)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "unregister",
-		Description: "Deregister a SIP account (regint=0). The account stays loaded but is no longer reachable for incoming calls.",
+		Description: "Deregister an account (regint=0).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in unregisterInput) (*mcp.CallToolResult, any, error) {
-		return uaregByAOR(ctx, client, in.AOR, 0)
+		return uaregOn(ctx, fleet, in.AOR, 0)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -243,7 +226,7 @@ func main() {
 		if limit == 0 {
 			limit = 50
 		}
-		snap := events.Snapshot(limit)
+		snap := fleet.Buffer().Snapshot(limit)
 		body, err := json.MarshalIndent(snap, "", "  ")
 		if err != nil {
 			return nil, nil, err
@@ -256,13 +239,20 @@ func main() {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "wait_for_event",
 		Description: "Block until a baresip event arrives matching the given filters, or until timeout. Use after dial/accept/hangup to observe call lifecycle without polling recent_events.",
-	}, waitForEventHandler(events, fanout))
+	}, waitForEventHandler(fleet))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "command",
-		Description: "Send an arbitrary baresip long-form command. Escape hatch for commands not exposed as dedicated tools.",
+		Description: "Send an arbitrary baresip long-form command. Pass 'aor' to route to a specific instance, else broadcast.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in rawInput) (*mcp.CallToolResult, any, error) {
-		return runCmd(ctx, client, in.Command, in.Params)
+		if in.AOR != "" {
+			c, err := fleet.ClientFor(in.AOR)
+			if err != nil {
+				return nil, nil, err
+			}
+			return runCmd(ctx, c, in.Command, in.Params)
+		}
+		return broadcast(ctx, fleet, in.Command, in.Params)
 	})
 
 	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
@@ -270,82 +260,19 @@ func main() {
 	}
 }
 
-type listCallsOutput struct {
-	UserAgents []baresip.UserAgentCalls `json:"user_agents"`
-	Raw        string                   `json:"raw"`
-}
-
-func listCallsHandler(c *baresip.Client) func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, listCallsOutput, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, listCallsOutput, error) {
-		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		resp, err := c.Do(cctx, "listcalls", "")
-		if err != nil {
-			return nil, listCallsOutput{}, err
-		}
-		out := listCallsOutput{
-			UserAgents: baresip.ParseListCalls(resp.Data),
-			Raw:        resp.Data,
-		}
-		return &mcp.CallToolResult{
-			IsError: !resp.OK,
-			Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
-		}, out, nil
-	}
-}
-
-type reginfoOutput struct {
-	Registrations []baresip.Registration `json:"registrations"`
-	Raw           string                 `json:"raw"`
-}
-
-func reginfoHandler(c *baresip.Client) func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, reginfoOutput, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, reginfoOutput, error) {
-		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		resp, err := c.Do(cctx, "reginfo", "")
-		if err != nil {
-			return nil, reginfoOutput{}, err
-		}
-		out := reginfoOutput{
-			Registrations: baresip.ParseRegInfo(resp.Data),
-			Raw:           resp.Data,
-		}
-		return &mcp.CallToolResult{
-			IsError: !resp.OK,
-			Content: []mcp.Content{&mcp.TextContent{Text: resp.Data}},
-		}, out, nil
-	}
-}
-
-// dialHandler implements 'from' selection and per-call custom headers
-// without a race. baresip's commands invoked through ctrl_tcp go through
-// menu_ua_carg, which requires an explicit UA index — uafind alone is
-// not honored. So when 'from' is given we resolve the AOR to its index
-// via reginfo and pass it to dial / uaaddheader / uarmheader.
-//
-// Headers are race-free because baresip copies ua->custom_hdrs into the
-// call at call_alloc time (ua.c ua_call_alloc → call_set_custom_hdrs).
-// Removing them on the UA right after dial leaves the active call
-// intact while keeping the UA clean for subsequent calls.
-func dialHandler(ctx context.Context, c *baresip.Client, in dialInput) (*mcp.CallToolResult, any, error) {
-	uaIdx := -1
-	if in.From != "" {
-		idx, err := lookupUAIndex(ctx, c, in.From)
-		if err != nil {
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("resolve UA index for %s: %v", in.From, err)}},
-			}, nil, nil
-		}
-		uaIdx = idx
-	}
-
-	if len(in.Headers) > 0 && uaIdx < 0 {
+// dialHandler issues uaaddheader/dial/uarmheader on the baresip hosting
+// in.From. Each baresip in the fleet has exactly one UA, so the UA index
+// is always 0.
+func dialHandler(ctx context.Context, f *Fleet, in dialInput) (*mcp.CallToolResult, any, error) {
+	if in.From == "" {
 		return &mcp.CallToolResult{
 			IsError: true,
-			Content: []mcp.Content{&mcp.TextContent{Text: "headers require 'from' so the UA index can be resolved"}},
+			Content: []mcp.Content{&mcp.TextContent{Text: "'from' is required (which account dials)"}},
 		}, nil, nil
+	}
+	c, err := f.ClientFor(in.From)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	keys := make([]string, 0, len(in.Headers))
@@ -354,9 +281,7 @@ func dialHandler(ctx context.Context, c *baresip.Client, in dialInput) (*mcp.Cal
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		// baresip's uri_header_unescape runs on the value, so callers can
-		// percent-encode anything special. We pass through as-is.
-		arg := fmt.Sprintf("%s=%s %d", k, in.Headers[k], uaIdx)
+		arg := fmt.Sprintf("%s=%s 0", k, in.Headers[k])
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		resp, err := c.Do(cctx, "uaaddheader", arg)
 		cancel()
@@ -371,59 +296,132 @@ func dialHandler(ctx context.Context, c *baresip.Client, in dialInput) (*mcp.Cal
 		}
 	}
 
-	dialArg := in.URI
-	if uaIdx >= 0 {
-		dialArg = fmt.Sprintf("%s %d", in.URI, uaIdx)
-	}
-	dialResult, _, dialErr := runCmd(ctx, c, "dial", dialArg)
+	dialResult, _, dialErr := runCmd(ctx, c, "dial", fmt.Sprintf("%s 0", in.URI))
 
-	// Clean up headers from the UA regardless of dial outcome. The active
-	// call (if dial succeeded) keeps them because baresip copied them at
-	// call_alloc time.
 	for _, k := range keys {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, _ = c.Do(cctx, "uarmheader", fmt.Sprintf("%s %d", k, uaIdx))
+		_, _ = c.Do(cctx, "uarmheader", fmt.Sprintf("%s 0", k))
 		cancel()
 	}
 
 	return dialResult, nil, dialErr
 }
 
-// uaregByAOR resolves an AOR to a UA index via reginfo, then runs uareg
-// with both the regint and explicit UA index. baresip's cmd_uareg uses
-// menu_ua_carg which requires two whitespace-separated words (regint and
-// index) when carg->data is NULL; without the index it returns NULL and
-// the handler silently no-ops.
-func uaregByAOR(ctx context.Context, c *baresip.Client, aor string, regint int) (*mcp.CallToolResult, any, error) {
-	idx, err := lookupUAIndex(ctx, c, aor)
+func uaregOn(ctx context.Context, f *Fleet, aor string, regint int) (*mcp.CallToolResult, any, error) {
+	c, err := f.ClientFor(aor)
 	if err != nil {
-		return &mcp.CallToolResult{
-			IsError: true,
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("resolve UA index for %s: %v", aor, err)}},
-		}, nil, nil
+		return nil, nil, err
 	}
-	return runCmd(ctx, c, "uareg", fmt.Sprintf("%d %d", regint, idx))
+	return runCmd(ctx, c, "uareg", fmt.Sprintf("%d 0", regint))
 }
 
-func lookupUAIndex(ctx context.Context, c *baresip.Client, aor string) (int, error) {
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	resp, err := c.Do(cctx, "reginfo", "")
-	cancel()
-	if err != nil {
-		return 0, err
-	}
-	if !resp.OK {
-		return 0, fmt.Errorf("reginfo failed: %s", resp.Data)
-	}
-	for _, r := range baresip.ParseRegInfo(resp.Data) {
-		if r.AOR == aor {
-			return r.Index, nil
+// broadcast runs the same command on every fleet client and returns the
+// first non-error response (or the last error if all failed). For
+// commands like callstat / hangupall this is the desired semantic.
+func broadcast(ctx context.Context, f *Fleet, cmd, params string) (*mcp.CallToolResult, any, error) {
+	var combined []string
+	var lastErr error
+	for aor, c := range f.All() {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		resp, err := c.Do(cctx, cmd, params)
+		cancel()
+		if err != nil {
+			lastErr = err
+			combined = append(combined, fmt.Sprintf("[%s] error: %v", aor, err))
+			continue
 		}
+		header := fmt.Sprintf("[%s]", aor)
+		if !resp.OK {
+			header += " (failed)"
+		}
+		body := strings.TrimRight(resp.Data, "\n")
+		combined = append(combined, fmt.Sprintf("%s %s", header, body))
 	}
-	return 0, fmt.Errorf("AOR %s not found in reginfo", aor)
+	if lastErr != nil && len(combined) == 0 {
+		return nil, nil, lastErr
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(combined, "\n")}},
+	}, nil, nil
 }
 
-func waitForEventHandler(buf *baresip.EventBuffer, fan *baresip.EventFanout) func(context.Context, *mcp.CallToolRequest, waitForEventInput) (*mcp.CallToolResult, waitForEventOutput, error) {
+// broadcastOrTargeted routes to a specific baresip if aor or callID
+// uniquely identifies one, otherwise broadcasts.
+func broadcastOrTargeted(ctx context.Context, f *Fleet, aor, callID, cmd, params string) (*mcp.CallToolResult, any, error) {
+	var c *baresip.Client
+	var err error
+	switch {
+	case callID != "":
+		c, _, err = f.ClientForCall(callID)
+	case aor != "":
+		c, err = f.ClientFor(aor)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if c != nil {
+		return runCmd(ctx, c, cmd, params)
+	}
+	return broadcast(ctx, f, cmd, params)
+}
+
+type listCallsOutput struct {
+	UserAgents []baresip.UserAgentCalls `json:"user_agents"`
+	Raw        string                   `json:"raw"`
+}
+
+func listCallsHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, listCallsOutput, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, listCallsOutput, error) {
+		var rawParts []string
+		var uas []baresip.UserAgentCalls
+		for aor, c := range f.All() {
+			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			resp, err := c.Do(cctx, "listcalls", "")
+			cancel()
+			if err != nil {
+				return nil, listCallsOutput{}, err
+			}
+			rawParts = append(rawParts, fmt.Sprintf("--- %s ---\n%s", aor, resp.Data))
+			uas = append(uas, baresip.ParseListCalls(resp.Data)...)
+		}
+		raw := strings.Join(rawParts, "\n")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: raw}},
+		}, listCallsOutput{UserAgents: uas, Raw: raw}, nil
+	}
+}
+
+type reginfoOutput struct {
+	Registrations []baresip.Registration `json:"registrations"`
+	Raw           string                 `json:"raw"`
+}
+
+func reginfoHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, empty) (*mcp.CallToolResult, reginfoOutput, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, reginfoOutput, error) {
+		var rawParts []string
+		var regs []baresip.Registration
+		for _, aor := range f.AccountAORs() {
+			c, err := f.ClientFor(aor)
+			if err != nil {
+				continue
+			}
+			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			resp, err := c.Do(cctx, "reginfo", "")
+			cancel()
+			if err != nil {
+				return nil, reginfoOutput{}, err
+			}
+			rawParts = append(rawParts, fmt.Sprintf("--- %s ---\n%s", aor, resp.Data))
+			regs = append(regs, baresip.ParseRegInfo(resp.Data)...)
+		}
+		raw := strings.Join(rawParts, "\n")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: raw}},
+		}, reginfoOutput{Registrations: regs, Raw: raw}, nil
+	}
+}
+
+func waitForEventHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, waitForEventInput) (*mcp.CallToolResult, waitForEventOutput, error) {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in waitForEventInput) (*mcp.CallToolResult, waitForEventOutput, error) {
 		timeout := time.Duration(in.TimeoutSeconds) * time.Second
 		if timeout <= 0 {
@@ -446,6 +444,15 @@ func waitForEventHandler(buf *baresip.EventBuffer, fan *baresip.EventFanout) fun
 					return false
 				}
 			}
+			if in.AOR != "" {
+				aor, _ := ev.Extra["fleet_aor"].(string)
+				if aor != in.AOR {
+					aor, _ = ev.Extra["accountaor"].(string)
+					if aor != in.AOR {
+						return false
+					}
+				}
+			}
 			if len(in.Types) == 0 {
 				return true
 			}
@@ -457,16 +464,12 @@ func waitForEventHandler(buf *baresip.EventBuffer, fan *baresip.EventFanout) fun
 			return false
 		}
 
-		// Subscribe first so we don't miss events that arrive while we're
-		// scanning the lookback buffer.
-		ch, unsub := fan.Subscribe()
+		ch, unsub := f.Fanout().Subscribe()
 		defer unsub()
 
-		// Lookback: check the ring buffer for a matching event newer than
-		// (now - lookback).
 		if lookback > 0 {
 			cutoff := time.Now().Add(-lookback)
-			snap := buf.Snapshot(0)
+			snap := f.Buffer().Snapshot(0)
 			for i := len(snap) - 1; i >= 0; i-- {
 				if snap[i].At.Before(cutoff) {
 					break

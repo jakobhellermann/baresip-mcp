@@ -23,9 +23,12 @@ CALL1='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reginfo",
 CALL2='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_calls","arguments":{}}}'
 LIST_TOOLS='{"jsonrpc":"2.0","id":6,"method":"tools/list"}'
 
-# Use an empty accounts file so the test is hermetic — no UAs, no surprises
-# from the host's ~/.baresip/accounts.
-: >"$WORK/accounts"
+# Two regint=0 fake accounts so the fleet has something to spawn but
+# nothing reaches the network. Hermetic.
+cat >"$WORK/accounts" <<EOF
+<sip:smoke1@localhost>;regint=0
+<sip:smoke2@localhost>;regint=0
+EOF
 
 OUT="$( { printf '%s\n%s\n%s\n%s\n%s\n' "$INIT" "$INITED" "$CALL1" "$CALL2" "$LIST_TOOLS"; sleep 3; } | \
   "$WORK/baresip-mcp" -accounts "$WORK/accounts" 2>"$WORK/mcp.log" || true )"
@@ -51,7 +54,7 @@ if ! grep -q '"user_agents"' <<<"$OUT"; then
   echo "FAIL: list_calls did not return structured output"
   exit 1
 fi
-for tool in dial accept hangup hangup_all list_calls call_status reginfo hold mute transfer dtmf uafind register unregister recent_events wait_for_event command; do
+for tool in dial accept hangup hangup_all list_calls call_status reginfo hold mute transfer dtmf register unregister recent_events wait_for_event command; do
   if ! grep -q "\"name\":\"$tool\"" <<<"$OUT"; then
     echo "FAIL: tool '$tool' not advertised in tools/list"
     exit 1
