@@ -79,10 +79,12 @@ type Registration struct {
 //   "0 - sip:alice@example.com    OK  sip:srv.example.com  Expires 60s"
 //   "1 - sip:bob@example.com      FB-ERR sip:fallback.example.com"
 //   "0 - sip:carol@example.com    zzz"
-// After ANSI stripping, the status token is one of: OK, ERR, zzz, optionally
-// prefixed with "FB-" for fallback.
+//   "0 - sip:dave@example.com"                                  ← regint=0, no reg object
+//
+// The status token is optional: accounts with regint=0 don't create a
+// reg object so baresip emits only the AOR.
 var regLineRE = regexp.MustCompile(
-	`^(\d+)\s+-\s+(\S+)\s+(FB-)?(OK|ERR|zzz)(?:\s+(\S+))?(?:\s+Expires\s+(\d+)s)?\s*$`)
+	`^(\d+)\s+-\s+(\S+)(?:\s+(FB-)?(OK|ERR|zzz)(?:\s+(\S+))?(?:\s+Expires\s+(\d+)s)?)?\s*$`)
 
 // ParseRegInfo parses the textual response of baresip's "reginfo" command.
 // Lines that don't match the expected layout are skipped.

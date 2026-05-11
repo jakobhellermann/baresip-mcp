@@ -33,6 +33,24 @@ func TestParseRegInfo(t *testing.T) {
 	}
 }
 
+func TestParseRegInfoRegintZero(t *testing.T) {
+	// regint=0 accounts have no reg object → baresip emits only the AOR
+	// after the index. Mix one regular and one regint=0 account.
+	input := "\n--- User Agents (2) ---\n" +
+		"0 - sip:alice@example.com                  \x1b[32mOK \x1b[;m sip:srv.example.com Expires 60s\n" +
+		"1 - sip:bob@proxy.dev.sipgate.de\n" +
+		"\n"
+
+	got := ParseRegInfo(input)
+	want := []Registration{
+		{Index: 0, AOR: "sip:alice@example.com", Status: "OK", Server: "sip:srv.example.com", Expires: 60},
+		{Index: 1, AOR: "sip:bob@proxy.dev.sipgate.de"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestParseRegInfoEmpty(t *testing.T) {
 	if got := ParseRegInfo("\n--- User Agents (0) ---\n\n"); got != nil {
 		t.Fatalf("expected nil, got %#v", got)
