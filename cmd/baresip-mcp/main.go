@@ -73,7 +73,7 @@ type waitForEventInput struct {
 	Types           []string `json:"types,omitempty" jsonschema:"event types to match (e.g. CALL_ESTABLISHED, CALL_CLOSED). Empty matches any event."`
 	CallID          string   `json:"call_id,omitempty" jsonschema:"optional baresip call id to filter on. If set, only events for that call match."`
 	TimeoutSeconds  int      `json:"timeout_seconds,omitempty" jsonschema:"max seconds to wait (default 30)"`
-	LookbackSeconds int      `json:"lookback_seconds,omitempty" jsonschema:"check the recent-events buffer for a matching event that already arrived this many seconds ago (default 5). Set to 0 to wait only for new events."`
+	LookbackSeconds int      `json:"lookback_seconds,omitempty" jsonschema:"check the recent-events buffer for a matching event that already arrived this many seconds ago (default 30). Set to -1 to disable lookback and only wait for new events."`
 }
 
 type waitForEventOutput struct {
@@ -429,9 +429,14 @@ func waitForEventHandler(buf *baresip.EventBuffer, fan *baresip.EventFanout) fun
 		if timeout <= 0 {
 			timeout = 30 * time.Second
 		}
-		lookback := time.Duration(in.LookbackSeconds) * time.Second
-		if in.LookbackSeconds == 0 {
-			lookback = 5 * time.Second
+		var lookback time.Duration
+		switch {
+		case in.LookbackSeconds < 0:
+			lookback = 0
+		case in.LookbackSeconds == 0:
+			lookback = 30 * time.Second
+		default:
+			lookback = time.Duration(in.LookbackSeconds) * time.Second
 		}
 
 		matches := func(ev baresip.Event) bool {
