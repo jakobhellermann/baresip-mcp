@@ -93,6 +93,14 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
+// Start begins the supervisor goroutine without requiring an initial
+// successful connection. While baresip is unreachable, Do returns
+// ErrDisconnected; the supervisor keeps retrying with backoff until
+// it succeeds or Close is called.
+func (c *Client) Start() {
+	go c.supervise()
+}
+
 // Close shuts the client down and waits for the supervisor to exit.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {

@@ -80,10 +80,17 @@ func main() {
 	defer stop()
 
 	client := baresip.New(*addr)
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Try an immediate connect so the common case (baresip already up)
+	// has tools working from the first request. If baresip isn't up yet,
+	// fall back to lazy mode — start the supervisor without an initial
+	// connection so tool calls return ErrDisconnected until baresip comes
+	// up, instead of crashing the MCP server.
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	if err := client.Connect(dialCtx); err != nil {
-		cancel()
-		log.Fatalf("connect baresip: %v", err)
+		log.Printf("baresip ctrl_tcp %s not yet reachable (%v); will retry in background", *addr, err)
+		client.Start()
+	} else {
+		log.Printf("connected to baresip ctrl_tcp at %s", *addr)
 	}
 	cancel()
 	defer client.Close()
