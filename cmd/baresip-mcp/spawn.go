@@ -136,6 +136,14 @@ func spawnBaresip(accountsSource string) (*baresipInstance, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Generate a short greeting WAV that aufile streams to the peer.
+	// Lives in the tmpdir so it's cleaned up with the rest.
+	greetingPath := filepath.Join(tmp, "greeting.wav")
+	useGreeting := true
+	if werr := writeGreetingWAV(greetingPath); werr != nil {
+		log.Printf("greeting.wav generation failed (%v); falling back to silence", werr)
+		useGreeting = false
+	}
 	cfgDir := filepath.Join(tmp, ".baresip")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		_ = os.RemoveAll(tmp)
@@ -151,20 +159,22 @@ func spawnBaresip(accountsSource string) (*baresipInstance, error) {
 sip_listen              0.0.0.0:0
 module_path             %s
 module                  g711.so
-module                  ausine.so
 module                  auconv.so
 module                  auresamp.so
+module                  stun.so
+module                  ice.so
 module                  account.so
 module                  fakevideo.so
 module                  menu.so
+module                  netroam.so
 module                  ctrl_tcp.so
 %s
 ctrl_tcp_listen         127.0.0.1:%d
-audio_source            ausine,440
+%s
 %s
 audio_buffer            20-160
 audio_buffer_mode       fixed
-`, modPath, audioModule, port, audioPlayer)
+`, modPath, audioModule, port, audioSourceLine(greetingPath, useGreeting), audioPlayer)
 	if err := os.WriteFile(filepath.Join(cfgDir, "config"), []byte(cfg), 0o644); err != nil {
 		_ = os.RemoveAll(tmp)
 		return nil, err
@@ -239,6 +249,14 @@ func waitForCtrlTCP(addr string, d time.Duration) error {
 // appropriate for the current OS. Falls back silently if the expected
 // module isn't present — the call still works, the user just won't hear
 // the remote.
+func audioSourceLine(greetingPath string, useGreeting bool) string {
+	if useGreeting {
+		return "module                  aufile.so\naudio_source            aufile," + greetingPath
+	}
+	// Fallback: silence via ausine at 0 Hz.
+	return "module                  ausine.so\naudio_source            ausine,0"
+}
+
 func platformAudio(modPath string) (moduleLine, audioPlayer string) {
 	type cand struct{ module, player string }
 	var candidates []cand
