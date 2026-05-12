@@ -237,8 +237,17 @@ func main() {
 		uriParams := map[string]string{}
 		addrParams := map[string]string{}
 		if in.AutoAnswerAfter > 0 {
-			addrParams["answermode"] = "auto"
-			addrParams["answerdelay"] = fmt.Sprintf("%d", in.AutoAnswerAfter)
+			// IMPORTANT: do NOT set ;answermode=auto. baresip's menu
+			// short-circuits answermode=auto and answers immediately,
+			// skipping the answerdelay timer entirely (see
+			// modules/menu/menu.c BEVENT_CALL_INCOMING). The delayed-
+			// answer path (check_delayed_answer → start_autoanswer →
+			// play_incoming → tmr_start) only runs when answermode is
+			// not auto but account_answerdelay > 0.
+			//
+			// baresip's account answerdelay is in *milliseconds* (cf.
+			// MIN_RINGTIME=1000 in menu.c). Our tool param is seconds.
+			addrParams["answerdelay"] = fmt.Sprintf("%d", in.AutoAnswerAfter*1000)
 		}
 		if in.Transport != "" {
 			uriParams["transport"] = in.Transport
