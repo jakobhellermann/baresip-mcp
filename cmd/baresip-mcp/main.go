@@ -83,7 +83,7 @@ type acceptInput struct {
 
 type registerInput struct {
 	AOR             string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
-	Regint          int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 600). 0 means do not register."`
+	Regint          int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 60). Short by design so the NAT/VPN pinhole keeping the inbound path open is refreshed before consumer-router UDP mappings expire (typically 30–180s). Set to 0 to stop registering."`
 	AutoAnswerAfter int    `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Appends ;answermode=auto;answerdelay=N to this account's line in the fleet's in-memory account spec — the spawned baresip child reads the augmented line from its own tmpdir, the user's ~/.baresip/accounts is never touched. Triggers a respawn of the baresip for this AOR if one is already running."`
 }
 
@@ -242,7 +242,7 @@ func main() {
 		}
 		regint := in.Regint
 		if regint == 0 {
-			regint = 600
+			regint = 60
 		}
 		return uaregOn(ctx, fleet, in.AOR, regint)
 	})
