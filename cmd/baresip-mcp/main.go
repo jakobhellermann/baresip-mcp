@@ -366,12 +366,58 @@ func dialHandler(ctx context.Context, f *Fleet, in dialInput) (*mcp.CallToolResu
 	return dialResult, nil, dialErr
 }
 
+// uaregOn issues uareg on the right baresip and then waits up to ~5s
+// for the matching REGISTERING → REGISTER_OK (or REGISTER_FAIL) event
+// before returning, so the caller actually knows the registrar
+// processed the change. The two pieces are stitched into a single
+// human-readable response.
 func uaregOn(ctx context.Context, f *Fleet, aor string, regint int) (*mcp.CallToolResult, any, error) {
 	c, err := f.ClientFor(ctx, aor)
 	if err != nil {
 		return nil, nil, err
 	}
-	return runCmd(ctx, c, "uareg", fmt.Sprintf("%d 0", regint))
+
+	// Subscribe before issuing the command so we don't miss the event.
+	ch, unsub := f.Fanout().Subscribe()
+	defer unsub()
+
+	resp, err := c.Do(ctx, "uareg", fmt.Sprintf("%d 0", regint))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	deadline := time.After(5 * time.Second)
+	var status string
+waitLoop:
+	for {
+		select {
+		case ev := <-ch:
+			if ea, _ := ev.Extra["accountaor"].(string); ea != aor {
+				continue
+			}
+			switch ev.Type {
+			case "REGISTER_OK":
+				status = fmt.Sprintf("REGISTER_OK (%s)", ev.Param)
+				break waitLoop
+			case "REGISTER_FAIL":
+				status = fmt.Sprintf("REGISTER_FAIL (%s)", ev.Param)
+				break waitLoop
+			case "UNREGISTERING":
+				// Mid-flight — keep waiting for the 200 OK.
+			}
+		case <-deadline:
+			status = "no REGISTER_OK/FAIL within 5s"
+			break waitLoop
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+
+	text := strings.TrimRight(resp.Data, "\n") + "\n" + status
+	return &mcp.CallToolResult{
+		IsError: !resp.OK,
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+	}, nil, nil
 }
 
 // broadcast runs the same command on every fleet client and returns the
