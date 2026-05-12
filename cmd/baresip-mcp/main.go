@@ -4,6 +4,15 @@
 // so calls between two local accounts (e1 → e2 by external number) work
 // — sipgate's hairpinned INVITE arrives at a different SIP socket than
 // the outgoing leg, avoiding state-machine collisions.
+//
+// The user's ~/.baresip/accounts is read ONCE at startup and is never
+// modified. Each child baresip runs out of its own tmpdir
+// (/tmp/baresip-mcp-<rand>/.baresip/) with a single-account accounts
+// file derived from the original line plus any per-account overrides
+// added at runtime (e.g. ;answermode=auto;answerdelay=N from the
+// register tool's auto_answer_after_seconds). To inspect the actual
+// per-child config, look at the tmpdir printed in stderr at spawn time,
+// not the user's accounts file.
 package main
 
 import (
@@ -72,9 +81,9 @@ type acceptInput struct {
 }
 
 type registerInput struct {
-	AOR              string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
-	Regint           int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 600). 0 means do not register."`
-	AutoAnswerAfter int    `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Internally sets ;answermode=auto;answerdelay=N on the account. Triggers a baresip respawn if one is already running."`
+	AOR             string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
+	Regint          int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 600). 0 means do not register."`
+	AutoAnswerAfter int    `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Appends ;answermode=auto;answerdelay=N to this account's line in the fleet's in-memory account spec — the spawned baresip child reads the augmented line from its own tmpdir, the user's ~/.baresip/accounts is never touched. Triggers a respawn of the baresip for this AOR if one is already running."`
 }
 
 type unregisterInput struct {
