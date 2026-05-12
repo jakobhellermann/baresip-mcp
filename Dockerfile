@@ -18,9 +18,7 @@ RUN apt-get update \
 
 COPY --from=build /out/baresip-mcp /usr/local/bin/baresip-mcp
 
-ENV BARESIP_CTRL_ADDR=127.0.0.1:4444
-
-# Note: this image does not start baresip for you — the MCP server connects
-# to an existing ctrl_tcp endpoint. To run baresip alongside, override the
-# entrypoint or use a sidecar container.
+# baresip-mcp spawns one baresip child per account in $BARESIP_ACCOUNTS
+# (default /root/.baresip/accounts). Mount your accounts file in when
+# running the container.
 ENTRYPOINT ["/usr/local/bin/baresip-mcp"]
