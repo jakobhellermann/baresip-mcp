@@ -85,6 +85,8 @@ type registerInput struct {
 	AOR             string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
 	Regint          int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 60). Short by design so the NAT/VPN pinhole keeping the inbound path open is refreshed before consumer-router UDP mappings expire (typically 30–180s). Set to 0 to stop registering."`
 	AutoAnswerAfter int    `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Appends ;answermode=auto;answerdelay=N to this account's line in the fleet's in-memory account spec — the spawned baresip child reads the augmented line from its own tmpdir, the user's ~/.baresip/accounts is never touched. Triggers a respawn of the baresip for this AOR if one is already running."`
+	Transport       string `json:"transport,omitempty" jsonschema:"SIP transport: 'udp' (default), 'tcp', or 'tls'. Non-UDP options often need a matching outbound_proxy because the registrar host may only listen UDP on its default address. For sipgate use outbound_proxy=sip:sip.dev.sipgate.de (dev) or sip:sip.sipgate.de (prod) when transport is tcp/tls/ws."`
+	OutboundProxy   string `json:"outbound_proxy,omitempty" jsonschema:"explicit outbound SIP proxy (e.g. 'sip:sip.dev.sipgate.de'). Combined with transport to produce an outbound URI baresip uses for REGISTER + INVITE. Triggers a respawn if already running."`
 }
 
 type unregisterInput struct {
@@ -232,10 +234,26 @@ func main() {
 		Name:        "register",
 		Description: "Register an account at its provider so it can receive incoming calls. Pass regint=0 to stop registering. Pass auto_answer_after_seconds>0 to enable delayed auto-answer (gives caller a ringback window).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, any, error) {
+		uriParams := map[string]string{}
+		addrParams := map[string]string{}
 		if in.AutoAnswerAfter > 0 {
-			if _, err := fleet.SetAccountAttrs(in.AOR, map[string]string{
-				"answermode":  "auto",
-				"answerdelay": fmt.Sprintf("%d", in.AutoAnswerAfter),
+			addrParams["answermode"] = "auto"
+			addrParams["answerdelay"] = fmt.Sprintf("%d", in.AutoAnswerAfter)
+		}
+		if in.Transport != "" {
+			uriParams["transport"] = in.Transport
+		}
+		if in.OutboundProxy != "" {
+			outbound := in.OutboundProxy
+			if in.Transport != "" && !strings.Contains(outbound, "transport=") {
+				outbound = outbound + ";transport=" + in.Transport
+			}
+			addrParams["outbound"] = outbound
+		}
+		if len(uriParams) > 0 || len(addrParams) > 0 {
+			if _, err := fleet.SetAccountAttrs(in.AOR, AccountOverrides{
+				URIParams:  uriParams,
+				AddrParams: addrParams,
 			}); err != nil {
 				return nil, nil, err
 			}

@@ -214,14 +214,23 @@ func (f *Fleet) AccountAORs() []string {
 	return f.aorsLocked()
 }
 
+// AccountOverrides bundles the in-memory modifications register can
+// apply to an account line. uri_params go inside the <sip:...> brackets
+// (e.g. transport=tcp), addr_params go after the > (e.g. outbound,
+// answermode, answerdelay).
+type AccountOverrides struct {
+	URIParams  map[string]string // inserted inside <sip:...;k=v>
+	AddrParams map[string]string // appended after > as ;k=v
+}
+
 // SetAccountAttrs augments the stored account line for aor with the
-// given baresip URI parameters (overwriting any existing values for
-// those keys). If the baresip for that AOR is currently running, it is
-// killed; the next ClientFor will respawn with the new attrs. Returns
-// the new account line.
+// given URI and addr params (overwriting any existing values for those
+// keys). If the baresip for that AOR is currently running, it is
+// gracefully unregistered and killed; the next ClientFor will respawn
+// with the new attrs. Returns the new account line.
 //
 // The user's on-disk accounts file is never touched.
-func (f *Fleet) SetAccountAttrs(aor string, attrs map[string]string) (string, error) {
+func (f *Fleet) SetAccountAttrs(aor string, ov AccountOverrides) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -236,7 +245,10 @@ func (f *Fleet) SetAccountAttrs(aor string, attrs map[string]string) (string, er
 		return "", fmt.Errorf("unknown AOR %s", aor)
 	}
 	line := f.accounts[idx].line
-	for k, v := range attrs {
+	for k, v := range ov.URIParams {
+		line = replaceOrAppendURIParam(line, k, v)
+	}
+	for k, v := range ov.AddrParams {
 		line = replaceOrAppendAccountParam(line, k, v)
 	}
 	f.accounts[idx].line = line
@@ -260,19 +272,60 @@ func (f *Fleet) SetAccountAttrs(aor string, attrs map[string]string) (string, er
 	return line, nil
 }
 
-// replaceOrAppendAccountParam replaces ;key=...; ... or appends ;key=value.
+// replaceOrAppendAccountParam works on addr-params after the closing >.
+// If the value contains ;, it is wrapped in double quotes (required by
+// baresip's account parser, e.g. for outbound="sip:host;transport=tcp").
 func replaceOrAppendAccountParam(line, key, value string) string {
+	wrapped := value
+	if strings.ContainsAny(value, ";? ") {
+		wrapped = `"` + value + `"`
+	}
 	prefix := ";" + key + "="
 	i := strings.Index(line, prefix)
 	if i < 0 {
-		return line + prefix + value
+		return line + prefix + wrapped
 	}
 	start := i + len(prefix)
+	// Account for an existing quoted value: skip until matching close-quote.
+	if start < len(line) && line[start] == '"' {
+		end := start + 1
+		for end < len(line) && line[end] != '"' {
+			end++
+		}
+		if end < len(line) {
+			end++ // include closing quote
+		}
+		return line[:start] + wrapped + line[end:]
+	}
 	end := start
 	for end < len(line) && line[end] != ';' && line[end] != '?' {
 		end++
 	}
-	return line[:start] + value + line[end:]
+	return line[:start] + wrapped + line[end:]
+}
+
+// replaceOrAppendURIParam edits URI parameters that live INSIDE the
+// <sip:...> angle brackets (e.g. transport). baresip parses these as
+// part of the SIP URI; transport in particular only takes effect there.
+func replaceOrAppendURIParam(line, key, value string) string {
+	open := strings.Index(line, "<")
+	close := strings.Index(line, ">")
+	if open < 0 || close < 0 || close < open {
+		return line // can't parse; leave it alone
+	}
+	inner := line[open+1 : close]
+	prefix := ";" + key + "="
+	if i := strings.Index(inner, prefix); i >= 0 {
+		start := i + len(prefix)
+		end := start
+		for end < len(inner) && inner[end] != ';' && inner[end] != '?' {
+			end++
+		}
+		inner = inner[:start] + value + inner[end:]
+	} else {
+		inner = inner + prefix + value
+	}
+	return line[:open+1] + inner + line[close:]
 }
 
 // InstanceFor returns metadata about the running baresip for aor.
