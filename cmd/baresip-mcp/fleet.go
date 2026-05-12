@@ -275,6 +275,31 @@ func replaceOrAppendAccountParam(line, key, value string) string {
 	return line[:start] + value + line[end:]
 }
 
+// InstanceFor returns metadata about the running baresip for aor.
+// Returns ok=false if no baresip is currently spawned for that AOR.
+func (f *Fleet) InstanceFor(aor string) (tmpDir, logPath, ctrlAddr string, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	inst, found := f.insts[aor]
+	if !found {
+		return "", "", "", false
+	}
+	return inst.tmpDir, inst.logPath, inst.addr, true
+}
+
+// AccountLine returns the in-memory account line (possibly augmented
+// via SetAccountAttrs) for aor.
+func (f *Fleet) AccountLine(aor string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, a := range f.accounts {
+		if a.aor == aor {
+			return a.line, true
+		}
+	}
+	return "", false
+}
+
 // LiveClients returns clients for currently-spawned baresips only.
 // Used by aggregated tools (reginfo, list_calls) that should not force
 // every account to spawn just to read state.

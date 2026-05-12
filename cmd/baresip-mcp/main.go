@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -92,6 +93,23 @@ type unregisterInput struct {
 
 type recentEventsInput struct {
 	Limit int `json:"limit,omitempty" jsonschema:"max number of most recent events to return (default 50)"`
+}
+
+type inspectAccountInput struct {
+	AOR      string `json:"aor" jsonschema:"AOR of the account to inspect"`
+	LogTail  int    `json:"log_tail,omitempty" jsonschema:"number of trailing lines from the baresip child's log to include (default 40, 0 for none)"`
+	LogGrep  string `json:"log_grep,omitempty" jsonschema:"optional substring filter applied to the tail before returning; e.g. 'binding' or 'REGISTER'"`
+}
+
+type inspectAccountOutput struct {
+	AOR             string `json:"aor"`
+	AccountLine     string `json:"account_line"`              // possibly augmented; auth_pass redacted
+	Running         bool   `json:"running"`
+	TmpDir          string `json:"tmpdir,omitempty"`
+	LogPath         string `json:"log_path,omitempty"`
+	CtrlTCPAddress  string `json:"ctrl_tcp_address,omitempty"`
+	AccountsContent string `json:"spawned_accounts_file,omitempty"` // auth_pass redacted
+	LogTail         string `json:"log_tail,omitempty"`
 }
 
 type waitForEventInput struct {
@@ -273,6 +291,11 @@ func main() {
 		return broadcast(ctx, fleet, in.Command, in.Params)
 	})
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "inspect_account",
+		Description: "Diagnostic: returns the in-memory account line (possibly augmented), the tmpdir + log path of the running baresip child (if any), and the last N lines of its log. Useful when something behaves unexpectedly and you need to verify what the spawned baresip actually saw.",
+	}, inspectAccountHandler(fleet))
+
 	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("mcp server: %v", err)
 	}
@@ -449,6 +472,73 @@ func reginfoHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, empty)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: raw}},
 		}, reginfoOutput{Registrations: regs, Raw: raw}, nil
+	}
+}
+
+var authPassRE = regexp.MustCompile(`auth_pass=[^;]*`)
+
+func redactAccountLine(s string) string {
+	return authPassRE.ReplaceAllString(s, "auth_pass=REDACTED")
+}
+
+func tailFile(path string, n int) (string, error) {
+	if n <= 0 {
+		return "", nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func inspectAccountHandler(f *Fleet) func(context.Context, *mcp.CallToolRequest, inspectAccountInput) (*mcp.CallToolResult, inspectAccountOutput, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in inspectAccountInput) (*mcp.CallToolResult, inspectAccountOutput, error) {
+		line, ok := f.AccountLine(in.AOR)
+		if !ok {
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("unknown AOR %s (configured: %v)", in.AOR, f.AccountAORs())}},
+			}, inspectAccountOutput{}, nil
+		}
+		out := inspectAccountOutput{
+			AOR:         in.AOR,
+			AccountLine: redactAccountLine(line),
+		}
+		tmpDir, logPath, ctrlAddr, running := f.InstanceFor(in.AOR)
+		out.Running = running
+		if running {
+			out.TmpDir = tmpDir
+			out.LogPath = logPath
+			out.CtrlTCPAddress = ctrlAddr
+			if body, err := os.ReadFile(filepath.Join(tmpDir, ".baresip", "accounts")); err == nil {
+				out.AccountsContent = redactAccountLine(strings.TrimRight(string(body), "\n"))
+			}
+			tail := in.LogTail
+			if tail == 0 {
+				tail = 40
+			}
+			if tailStr, err := tailFile(logPath, tail); err == nil {
+				if in.LogGrep != "" {
+					var kept []string
+					for _, l := range strings.Split(tailStr, "\n") {
+						if strings.Contains(l, in.LogGrep) {
+							kept = append(kept, l)
+						}
+					}
+					tailStr = strings.Join(kept, "\n")
+				}
+				out.LogTail = tailStr
+			}
+		}
+		body, _ := json.MarshalIndent(out, "", "  ")
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(body)}},
+		}, out, nil
 	}
 }
 
