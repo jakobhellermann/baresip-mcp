@@ -183,7 +183,14 @@ func (f *Fleet) Close() {
 	f.clients = map[string]*baresip.Client{}
 	f.insts = map[string]*baresipInstance{}
 	f.mu.Unlock()
+	// Synchronously unregister each live baresip so sipgate forgets our
+	// bindings before we exit. baresip's own SIGTERM handler does this
+	// too, but doesn't always wait for the 200 OK before tearing down —
+	// firing uareg via ctrl_tcp and giving it 3s makes it deterministic.
 	for _, c := range clients {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _ = c.Do(ctx, "uareg", "0 0")
+		cancel()
 		_ = c.Close()
 	}
 	for _, inst := range insts {
@@ -235,9 +242,14 @@ func (f *Fleet) SetAccountAttrs(aor string, attrs map[string]string) (string, er
 	f.accounts[idx].line = line
 
 	// Drop the running baresip so the next ClientFor respawns with the
-	// new attrs. Active calls on that baresip end abruptly — acceptable
-	// for a config change.
+	// new attrs. Before that, synchronously ask baresip to unregister
+	// (uareg 0 0) so sipgate forgets this binding immediately. Otherwise
+	// the stale binding lingers until Expires (~600s) and sipgate may
+	// fork inbound calls to it, causing NO_ANSWER.
 	if c, ok := f.clients[aor]; ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _ = c.Do(ctx, "uareg", "0 0")
+		cancel()
 		_ = c.Close()
 		delete(f.clients, aor)
 	}
