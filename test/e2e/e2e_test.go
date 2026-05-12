@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -60,14 +59,17 @@ func startBaresip(t *testing.T, name string, sipPort, ctrlPort int, modPath, acc
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
+	// Codec choice matters: Ubuntu's baresip 1.0 doesn't ship auconv/auresamp,
+	// so picking an 8kHz codec like PCMU against the 48kHz-only ausine source
+	// fails. Load opus first so it wins codec negotiation — opus is 48kHz
+	// natively and matches ausine's output rate.
 	cfg := fmt.Sprintf(`
 sip_listen              127.0.0.1:%d
 net_interface           127.0.0.1
 module_path             %s
+module                  opus.so
 module                  g711.so
 module                  ausine.so
-module                  auconv.so
-module                  auresamp.so
 module                  account.so
 module                  fakevideo.so
 module                  menu.so
@@ -117,30 +119,21 @@ audio_source            ausine,440
 	return inst
 }
 
-func waitFor(t *testing.T, desc string, d time.Duration, fn func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		if fn() {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", desc)
-}
-
 func TestE2ECallBetweenTwoBaresips(t *testing.T) {
 	modPath := locateModulePath(t)
 
+	// baresip auto-binds TCP and TLS on sip_listen+1/+2 in addition to the
+	// configured UDP port, so leave enough headroom between A and B that
+	// those derived ports don't collide.
 	const (
 		sipA, ctrlA = 25070, 24444
-		sipB, ctrlB = 25071, 24445
+		sipB, ctrlB = 25080, 24445
 	)
 
 	startBaresip(t, "A", sipA, ctrlA, modPath,
 		fmt.Sprintf("<sip:a@127.0.0.1:%d>;regint=0", sipA))
 	startBaresip(t, "B", sipB, ctrlB, modPath,
-		fmt.Sprintf("<sip:b@127.0.0.1:%d>;regint=0;catchall=yes", sipB))
+		fmt.Sprintf("<sip:e2e@127.0.0.1:%d>;regint=0", sipB))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -169,8 +162,9 @@ func TestE2ECallBetweenTwoBaresips(t *testing.T) {
 	clientB := dialCtrl(fmt.Sprintf("127.0.0.1:%d", ctrlB))
 	defer clientB.Close()
 
-	// Drain events on both sides so the channels don't fill up.
+	// Buffer events on both sides so we can wait on them by type.
 	eventsA := make(chan baresip.Event, 64)
+	eventsB := make(chan baresip.Event, 64)
 	go func() {
 		for ev := range clientA.Events() {
 			select {
@@ -180,9 +174,30 @@ func TestE2ECallBetweenTwoBaresips(t *testing.T) {
 		}
 	}()
 	go func() {
-		for range clientB.Events() {
+		for ev := range clientB.Events() {
+			select {
+			case eventsB <- ev:
+			default:
+			}
 		}
 	}()
+
+	waitForEvent := func(ch <-chan baresip.Event, types ...string) baresip.Event {
+		t.Helper()
+		timeout := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-ch:
+				for _, ty := range types {
+					if ev.Type == ty {
+						return ev
+					}
+				}
+			case <-timeout:
+				t.Fatalf("timed out waiting for event %v", types)
+			}
+		}
+	}
 
 	// A dials B by URI — no registration, just direct INVITE to the SIP port.
 	target := fmt.Sprintf("sip:e2e@127.0.0.1:%d", sipB)
@@ -196,19 +211,7 @@ func TestE2ECallBetweenTwoBaresips(t *testing.T) {
 	}
 
 	// Wait for B to see an incoming call, then accept it.
-	waitFor(t, "incoming call on B", 5*time.Second, func() bool {
-		r, err := clientB.Do(ctx, "listcalls", "")
-		if err != nil {
-			return false
-		}
-		calls := baresip.ParseListCalls(r.Data)
-		for _, ua := range calls {
-			if len(ua.Calls) > 0 {
-				return true
-			}
-		}
-		return false
-	})
+	waitForEvent(eventsB, "CALL_INCOMING")
 
 	t.Log("B accepting call")
 	resp, err = clientB.Do(ctx, "accept", "")
@@ -220,52 +223,13 @@ func TestE2ECallBetweenTwoBaresips(t *testing.T) {
 	}
 
 	// Wait for A to see the call as ESTABLISHED.
-	waitFor(t, "call ESTABLISHED on A", 5*time.Second, func() bool {
-		r, err := clientA.Do(ctx, "listcalls", "")
-		if err != nil {
-			return false
-		}
-		calls := baresip.ParseListCalls(r.Data)
-		for _, ua := range calls {
-			for _, c := range ua.Calls {
-				if c.State == "ESTABLISHED" {
-					return true
-				}
-			}
-		}
-		return false
-	})
+	waitForEvent(eventsA, "CALL_ESTABLISHED")
 
 	t.Log("A hanging up")
 	if _, err := clientA.Do(ctx, "hangup", ""); err != nil {
 		t.Fatalf("hangup: %v", err)
 	}
 
-	// Verify the event stream on A saw both ESTABLISHED and CLOSED.
-	var sawEstablished, sawClosed bool
-	collectDeadline := time.After(3 * time.Second)
-collect:
-	for {
-		select {
-		case ev := <-eventsA:
-			t.Logf("A event: class=%s type=%s param=%s", ev.Class, ev.Type, ev.Param)
-			if strings.Contains(ev.Type, "ESTABLISHED") {
-				sawEstablished = true
-			}
-			if strings.Contains(ev.Type, "CLOSED") {
-				sawClosed = true
-			}
-			if sawEstablished && sawClosed {
-				break collect
-			}
-		case <-collectDeadline:
-			break collect
-		}
-	}
-	if !sawEstablished {
-		t.Error("A never saw an ESTABLISHED event")
-	}
-	if !sawClosed {
-		t.Error("A never saw a CLOSED event")
-	}
+	// ESTABLISHED was already consumed above; now wait for CLOSED after hangup.
+	waitForEvent(eventsA, "CALL_CLOSED")
 }
