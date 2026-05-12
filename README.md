@@ -1,21 +1,29 @@
 # baresip-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that exposes a running
-[baresip](https://github.com/baresip/baresip) instance to LLM clients. It
-talks to baresip through the `ctrl_tcp` module (JSON-over-netstring) and
-publishes a set of typed tools plus an `recent_events` query for the
-asynchronous event stream.
+An [MCP](https://modelcontextprotocol.io) server that drives
+[baresip](https://github.com/baresip/baresip) on behalf of an LLM client.
+At startup it reads `~/.baresip/accounts` and spawns one headless
+baresip child per active account, each with its own tmpdir, SIP port,
+and `ctrl_tcp` listener. It then publishes a set of typed tools plus
+a `recent_events` query for the asynchronous event stream.
 
 ## Architecture
 
 ```
-LLM client ──stdio MCP──▶ baresip-mcp ──TCP ctrl_tcp──▶ baresip
+                                            ┌─▶ baresip (account A)
+LLM client ──stdio MCP ──▶ baresip-mcp ─────┼─▶ baresip (account B)
+                                            └─▶ baresip (account C)
 ```
 
 - `pkg/baresip` — TCP client with netstring framing, JSON command/response
   correlation via tokens, async event channel, and reconnect-with-backoff.
 - `cmd/baresip-mcp` — MCP stdio server using
-  [`github.com/modelcontextprotocol/go-sdk`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk).
+  [`github.com/modelcontextprotocol/go-sdk`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk);
+  manages the per-account baresip fleet.
+
+One process per account is intentional: sipgate hairpins INVITEs between
+two local accounts, so each leg needs its own SIP socket to avoid
+state-machine collisions.
 
 ## Tools
 
@@ -32,26 +40,36 @@ LLM client ──stdio MCP──▶ baresip-mcp ──TCP ctrl_tcp──▶ bare
 | `mute`           | Mute / unmute the active call                        |
 | `transfer`       | Blind-transfer the active call                       |
 | `dtmf`           | Send DTMF digits                                     |
-| `uafind`         | Look up a configured User-Agent by AOR               |
+| `register`       | (Re-)register an account; can also set auto-answer, transport, outbound proxy (respawns the child) |
+| `unregister`     | Deregister an account                                |
+| `inspect_account`| Show the per-child accounts line, tmpdir, ctrl_tcp address, and tail of the baresip log |
 | `recent_events`  | Return recent async baresip events as JSON           |
+| `wait_for_event` | Block until a matching event arrives (by type / call_id / AOR) |
 | `command`        | Raw escape hatch for any baresip long-form command   |
 
 ## Baresip configuration
 
-Enable the `ctrl_tcp` module in your `~/.baresip/config`:
+You do **not** need to run baresip yourself, and you do not need to
+configure `ctrl_tcp` by hand — baresip-mcp spawns one baresip child per
+account and writes the necessary config (`ctrl_tcp.so` + a free port)
+into a per-child tmpdir.
 
-```
-module          ctrl_tcp.so
-ctrl_tcp_listen 127.0.0.1:4444
-```
+The only thing it reads from your home directory is the accounts file
+at `~/.baresip/accounts` (override with `-accounts` or
+`BARESIP_ACCOUNTS`). The user's accounts file is never modified;
+per-account overrides set at runtime (e.g. via the `register` tool's
+`auto_answer_after_seconds`, `transport`, `outbound_proxy`) are written
+into the child's tmpdir only.
 
-Start baresip as usual.
+The `baresip` binary must be on `PATH`, and the baresip module
+directory must be discoverable (set `BARESIP_MODPATH` if your install
+keeps modules in a non-standard location).
 
 ## Build & run
 
 ```sh
 go build ./cmd/baresip-mcp
-./baresip-mcp -addr 127.0.0.1:4444
+./baresip-mcp
 ```
 
 The server speaks MCP over stdin/stdout, so it is meant to be spawned by
@@ -66,15 +84,11 @@ Add the following to your `~/.claude/settings.json` (or project-local
 {
   "mcpServers": {
     "baresip": {
-      "command": "/absolute/path/to/baresip-mcp",
-      "args": ["-addr", "127.0.0.1:4444"]
+      "command": "/absolute/path/to/baresip-mcp"
     }
   }
 }
 ```
-
-Environment variable `BARESIP_CTRL_ADDR` overrides the default
-`127.0.0.1:4444`.
 
 ## Tests
 
