@@ -226,7 +226,7 @@ func main() {
 		Name:        "dtmf",
 		Description: "Send DTMF digits to a call.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dtmfInput) (*mcp.CallToolResult, any, error) {
-		return broadcastOrTargeted(ctx, fleet, "", in.CallID, "sndcode", in.Digits)
+		return sendDTMF(ctx, fleet, in.CallID, in.Digits)
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -476,6 +476,46 @@ func broadcast(ctx context.Context, f *Fleet, cmd, params string) (*mcp.CallTool
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(combined, "\n")}},
 	}, nil, nil
+}
+
+// dtmfInterDigitGap is the pause between consecutive RFC2833 events.
+// baresip's `sndcode` issues a single trailing KEYCODE_REL no matter how
+// many digits were passed, and `audio_send_digit` overwrites telev's
+// cur_key per digit without releasing the previous one first — so a
+// multi-digit `sndcode` call typically only delivers the last digit (or
+// none). We work around it by issuing one `sndcode` per digit and waiting
+// long enough that each event's redundant end-packets clear before the
+// next event starts.
+const dtmfInterDigitGap = 450 * time.Millisecond
+
+// sendDTMF sends DTMF digits one at a time so each digit gets its own
+// proper RFC2833 send-then-release pair. Returns the result of the final
+// digit (any per-digit error short-circuits).
+func sendDTMF(ctx context.Context, f *Fleet, callID, digits string) (*mcp.CallToolResult, any, error) {
+	if digits == "" {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "ok: dtmf (no digits)"}},
+		}, nil, nil
+	}
+	var last *mcp.CallToolResult
+	for i := 0; i < len(digits); i++ {
+		res, _, err := broadcastOrTargeted(ctx, f, "", callID, "sndcode", string(digits[i]))
+		if err != nil {
+			return nil, nil, err
+		}
+		last = res
+		if res != nil && res.IsError {
+			return res, nil, nil
+		}
+		if i < len(digits)-1 {
+			select {
+			case <-time.After(dtmfInterDigitGap):
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		}
+	}
+	return last, nil, nil
 }
 
 // broadcastOrTargeted routes to a specific baresip if aor or callID
@@ -766,6 +806,17 @@ func buildAccountLine(aor, password, username string, extra map[string]string) (
 	if username != "" {
 		b.WriteString(";auth_user=")
 		b.WriteString(username)
+	}
+	// Default dtmfmode=info: this fleet's audio source (aufile playing a
+	// short greeting WAV) stops feeding samples after the greeting ends,
+	// which halts the RTP TX thread and strands any RFC2833 telephone-
+	// event queued via telev — receivers see only the first DTMF digit
+	// (or none). SIP INFO rides the signaling channel and is independent
+	// of RTP TX state. Callers can override via extra_params
+	// (e.g. dtmfmode=rtpevent or dtmfmode=auto) if the peer only handles
+	// in-band/RFC2833 and a continuous audio source is in use.
+	if _, set := extra["dtmfmode"]; !set {
+		b.WriteString(";dtmfmode=info")
 	}
 	// Stable iteration order so a re-register with the same inputs produces
 	// the same line (matters for the respawn-on-change comparison).
