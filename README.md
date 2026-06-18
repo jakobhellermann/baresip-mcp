@@ -2,10 +2,11 @@
 
 An [MCP](https://modelcontextprotocol.io) server that drives
 [baresip](https://github.com/baresip/baresip) on behalf of an LLM client.
-At startup it reads `~/.baresip/accounts` and spawns one headless
-baresip child per active account, each with its own tmpdir, SIP port,
-and `ctrl_tcp` listener. It then publishes a set of typed tools plus
-a `recent_events` query for the asynchronous event stream.
+It starts with an empty fleet; accounts are introduced at runtime via
+the `register` tool, and each gets its own headless baresip child with
+its own tmpdir, SIP port, and `ctrl_tcp` listener. It publishes a set
+of typed tools plus a `recent_events` query for the asynchronous event
+stream.
 
 ## Architecture
 
@@ -40,7 +41,7 @@ state-machine collisions.
 | `mute`           | Mute / unmute the active call                        |
 | `transfer`       | Blind-transfer the active call                       |
 | `dtmf`           | Send DTMF digits                                     |
-| `register`       | (Re-)register an account; can also set auto-answer, transport, outbound proxy (respawns the child) |
+| `register`       | Introduce an account (AOR + password) and register it; can also set auto-answer, transport, outbound proxy (respawns the child) |
 | `unregister`     | Deregister an account                                |
 | `inspect_account`| Show the per-child accounts line, tmpdir, ctrl_tcp address, and tail of the baresip log |
 | `recent_events`  | Return recent async baresip events as JSON           |
@@ -54,8 +55,8 @@ You do **not** need to run baresip yourself or hand-configure
 account and writes the necessary config into a per-child tmpdir.
 
 baresip-mcp reads **no** accounts file. Accounts come in at runtime
-through the `register` MCP tool (AOR + `auth_pass`, plus optional
-`auth_user` / `extra_params`). The credentials live only in memory and
+through the `register` MCP tool (AOR + `password`, plus optional
+`username` / `extra_params`). The credentials live only in memory and
 in the spawned child's tmpdir.
 
 The `baresip` binary must be on `PATH`, and the baresip module
