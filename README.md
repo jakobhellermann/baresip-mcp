@@ -88,6 +88,29 @@ Add the following to your `~/.claude/settings.json` (or project-local
 }
 ```
 
+### …or without installing anything, via the Docker image
+
+The published image bundles baresip, so there is nothing to build or put
+on `PATH`. Point the MCP client at `docker` — the container is the server
+and speaks MCP over the stdio it inherits:
+
+```json
+{
+  "mcpServers": {
+    "baresip": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "--network", "host",
+               "ghcr.io/jakobhellermann/baresip-mcp:latest"]
+    }
+  }
+}
+```
+
+SIP and RTP are UDP, so `--network host` (Linux) is usually needed for
+registration and media to traverse NAT. On Docker Desktop (macOS/Windows)
+host networking is limited; a locally built binary is the smoother path
+there.
+
 ## Tests
 
 ```sh
