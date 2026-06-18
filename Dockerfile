@@ -18,7 +18,6 @@ RUN apt-get update \
 
 COPY --from=build /out/baresip-mcp /usr/local/bin/baresip-mcp
 
-# baresip-mcp spawns one baresip child per account in $BARESIP_ACCOUNTS
-# (default /root/.baresip/accounts). Mount your accounts file in when
-# running the container.
+# baresip-mcp starts with an empty fleet. Accounts (AOR + auth_pass)
+# are introduced at runtime via the `register` MCP tool.
 ENTRYPOINT ["/usr/local/bin/baresip-mcp"]

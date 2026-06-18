@@ -16,22 +16,19 @@ echo "==> using temp dir $WORK"
 echo "==> building baresip-mcp"
 ( cd "$ROOT" && go build -o "$WORK/baresip-mcp" ./cmd/baresip-mcp )
 
-echo "==> driving baresip-mcp over stdio (spawns its own baresip)"
+echo "==> driving baresip-mcp over stdio (starts empty, register introduces accounts)"
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
 INITED='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+# Register two hermetic regint=0 accounts so the fleet has something to
+# report; regint=0 means baresip will spawn but never hit the network.
+REG1='{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"register","arguments":{"aor":"sip:smoke1@localhost","password":"smoke","regint":0}}}'
+REG2='{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"register","arguments":{"aor":"sip:smoke2@localhost","password":"smoke","regint":0}}}'
 CALL1='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reginfo","arguments":{}}}'
 CALL2='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_calls","arguments":{}}}'
 LIST_TOOLS='{"jsonrpc":"2.0","id":6,"method":"tools/list"}'
 
-# Two regint=0 fake accounts so the fleet has something to spawn but
-# nothing reaches the network. Hermetic.
-cat >"$WORK/accounts" <<EOF
-<sip:smoke1@localhost>;regint=0
-<sip:smoke2@localhost>;regint=0
-EOF
-
-OUT="$( { printf '%s\n%s\n%s\n%s\n%s\n' "$INIT" "$INITED" "$CALL1" "$CALL2" "$LIST_TOOLS"; sleep 3; } | \
-  "$WORK/baresip-mcp" -accounts "$WORK/accounts" 2>"$WORK/mcp.log" || true )"
+OUT="$( { printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$INIT" "$INITED" "$REG1" "$REG2" "$CALL1" "$CALL2" "$LIST_TOOLS"; sleep 3; } | \
+  "$WORK/baresip-mcp" 2>"$WORK/mcp.log" || true )"
 
 echo "--- mcp stdout ---"
 echo "$OUT"

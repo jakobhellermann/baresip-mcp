@@ -49,17 +49,14 @@ state-machine collisions.
 
 ## Baresip configuration
 
-You do **not** need to run baresip yourself, and you do not need to
-configure `ctrl_tcp` by hand — baresip-mcp spawns one baresip child per
-account and writes the necessary config (`ctrl_tcp.so` + a free port)
-into a per-child tmpdir.
+You do **not** need to run baresip yourself or hand-configure
+`ctrl_tcp` — baresip-mcp spawns one baresip child per registered
+account and writes the necessary config into a per-child tmpdir.
 
-The only thing it reads from your home directory is the accounts file
-at `~/.baresip/accounts` (override with `-accounts` or
-`BARESIP_ACCOUNTS`). The user's accounts file is never modified;
-per-account overrides set at runtime (e.g. via the `register` tool's
-`auto_answer_after_seconds`, `transport`, `outbound_proxy`) are written
-into the child's tmpdir only.
+baresip-mcp reads **no** accounts file. Accounts come in at runtime
+through the `register` MCP tool (AOR + `auth_pass`, plus optional
+`auth_user` / `extra_params`). The credentials live only in memory and
+in the spawned child's tmpdir.
 
 The `baresip` binary must be on `PATH`, and the baresip module
 directory must be discoverable (set `BARESIP_MODPATH` if your install

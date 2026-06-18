@@ -1,18 +1,18 @@
 // Command baresip-mcp exposes a baresip ctrl_tcp connection as an MCP server.
 //
-// Each account in ~/.baresip/accounts gets its own baresip child process
-// so calls between two local accounts (e1 → e2 by external number) work
-// — sipgate's hairpinned INVITE arrives at a different SIP socket than
-// the outgoing leg, avoiding state-machine collisions.
+// Accounts are introduced at runtime through the `register` MCP tool —
+// the server reads no on-disk accounts file. Each registered account
+// gets its own baresip child process so calls between two local
+// accounts (e1 → e2 by external number) work: sipgate's hairpinned
+// INVITE arrives at a different SIP socket than the outgoing leg,
+// avoiding state-machine collisions.
 //
-// The user's ~/.baresip/accounts is read ONCE at startup and is never
-// modified. Each child baresip runs out of its own tmpdir
+// Each child baresip runs out of its own tmpdir
 // (/tmp/baresip-mcp-<rand>/.baresip/) with a single-account accounts
-// file derived from the original line plus any per-account overrides
-// added at runtime (e.g. ;answermode=auto;answerdelay=N from the
-// register tool's auto_answer_after_seconds). To inspect the actual
-// per-child config, look at the tmpdir printed in stderr at spawn time,
-// not the user's accounts file.
+// file built from the register call's inputs plus any per-account
+// overrides (e.g. ;answerdelay=N from auto_answer_after_seconds). To
+// inspect the actual per-child config, look at the tmpdir printed in
+// stderr at spawn time.
 package main
 
 import (
@@ -37,7 +37,7 @@ import (
 
 type dialInput struct {
 	URI     string            `json:"uri" jsonschema:"SIP URI to dial, e.g. sip:alice@example.com"`
-	From    string            `json:"from" jsonschema:"AOR of the local account to call from, e.g. sip:1126226e1@proxy.dev.sipgate.de. Selects which baresip instance dials."`
+	Account string            `json:"account" jsonschema:"AOR of the local account to call from, e.g. sip:1126226e1@proxy.dev.sipgate.de. Selects which baresip instance dials."`
 	Headers map[string]string `json:"headers,omitempty" jsonschema:"optional SIP headers to attach to this specific outgoing INVITE, e.g. {\"X-Client-Correlation-ID\": \"abc-123\"}. Headers are scoped to this call only — set on the UA before dial, copied into the call by baresip, then removed."`
 }
 
@@ -82,11 +82,14 @@ type acceptInput struct {
 }
 
 type registerInput struct {
-	AOR             string `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
-	Regint          int    `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 60). Short by design so the NAT/VPN pinhole keeping the inbound path open is refreshed before consumer-router UDP mappings expire (typically 30–180s). Set to 0 to stop registering."`
-	AutoAnswerAfter int    `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Appends ;answermode=auto;answerdelay=N to this account's line in the fleet's in-memory account spec — the spawned baresip child reads the augmented line from its own tmpdir, the user's ~/.baresip/accounts is never touched. Triggers a respawn of the baresip for this AOR if one is already running."`
-	Transport       string `json:"transport,omitempty" jsonschema:"SIP transport: 'udp' (default), 'tcp', or 'tls'. Non-UDP options often need a matching outbound_proxy because the registrar host may only listen UDP on its default address. For sipgate use outbound_proxy=sip:sip.dev.sipgate.de (dev) or sip:sip.sipgate.de (prod) when transport is tcp/tls/ws."`
-	OutboundProxy   string `json:"outbound_proxy,omitempty" jsonschema:"explicit outbound SIP proxy (e.g. 'sip:sip.dev.sipgate.de'). Combined with transport to produce an outbound URI baresip uses for REGISTER + INVITE. Triggers a respawn if already running."`
+	AOR             string            `json:"aor" jsonschema:"AOR of the account to register, e.g. sip:1126226e1@proxy.dev.sipgate.de"`
+	Password        string            `json:"password,omitempty" jsonschema:"SIP authentication password. Required the first time you register a given AOR; on subsequent register calls for the same AOR the stored line is reused if omitted. The password lives only in memory and in the spawned baresip child's tmpdir."`
+	Username        string            `json:"username,omitempty" jsonschema:"SIP authentication username. Optional — defaults to the user part of the AOR, which is correct for sipgate extensions/voizas. Trunks typically need it set explicitly to the trunk-extension id."`
+	ExtraParams     map[string]string `json:"extra_params,omitempty" jsonschema:"optional additional baresip account params appended after the AOR (e.g. {\"audio_codecs\": \"pcma\", \"stunserver\": \"stun:stun.sipgate.net\"}). Only applied when introducing a new AOR; ignored on re-registration of a known AOR."`
+	Regint          int               `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 60). Short by design so the NAT/VPN pinhole keeping the inbound path open is refreshed before consumer-router UDP mappings expire (typically 30–180s). Set to 0 to stop registering."`
+	AutoAnswerAfter int               `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Appends ;answerdelay=N (in ms; baresip uses MIN_RINGTIME=1000) to this account's in-memory line. Triggers a respawn of the baresip for this AOR if one is already running."`
+	Transport       string            `json:"transport,omitempty" jsonschema:"SIP transport: 'udp' (default), 'tcp', or 'tls'. Non-UDP options often need a matching outbound_proxy because the registrar host may only listen UDP on its default address. For sipgate use outbound_proxy=sip:sip.dev.sipgate.de (dev) or sip:sip.sipgate.de (prod) when transport is tcp/tls/ws."`
+	OutboundProxy   string            `json:"outbound_proxy,omitempty" jsonschema:"explicit outbound SIP proxy (e.g. 'sip:sip.dev.sipgate.de'). Combined with transport to produce an outbound URI baresip uses for REGISTER + INVITE. Triggers a respawn if already running."`
 }
 
 type unregisterInput struct {
@@ -98,14 +101,14 @@ type recentEventsInput struct {
 }
 
 type inspectAccountInput struct {
-	AOR      string `json:"aor" jsonschema:"AOR of the account to inspect"`
-	LogTail  int    `json:"log_tail,omitempty" jsonschema:"number of trailing lines from the baresip child's log to include (default 40, 0 for none)"`
-	LogGrep  string `json:"log_grep,omitempty" jsonschema:"optional substring filter applied to the tail before returning; e.g. 'binding' or 'REGISTER'"`
+	AOR     string `json:"aor" jsonschema:"AOR of the account to inspect"`
+	LogTail int    `json:"log_tail,omitempty" jsonschema:"number of trailing lines from the baresip child's log to include (default 40, 0 for none)"`
+	LogGrep string `json:"log_grep,omitempty" jsonschema:"optional substring filter applied to the tail before returning; e.g. 'binding' or 'REGISTER'"`
 }
 
 type inspectAccountOutput struct {
 	AOR             string `json:"aor"`
-	AccountLine     string `json:"account_line"`              // possibly augmented; auth_pass redacted
+	AccountLine     string `json:"account_line"` // possibly augmented; auth_pass redacted
 	Running         bool   `json:"running"`
 	TmpDir          string `json:"tmpdir,omitempty"`
 	LogPath         string `json:"log_path,omitempty"`
@@ -128,7 +131,6 @@ type waitForEventOutput struct {
 }
 
 func main() {
-	accountsPath := flag.String("accounts", envOr("BARESIP_ACCOUNTS", defaultAccountsPath()), "path to a baresip accounts file; one baresip child is spawned per active line")
 	bufSize := flag.Int("event-buffer", 256, "size of the recent-events ring buffer")
 	flag.Parse()
 
@@ -137,12 +139,9 @@ func main() {
 
 	sweepOrphans()
 
-	fleet, err := NewFleet(ctx, *accountsPath, *bufSize)
-	if err != nil {
-		log.Fatalf("start fleet: %v", err)
-	}
+	fleet := NewFleet(ctx, *bufSize)
 	defer fleet.Close()
-	log.Printf("fleet ready with %d account(s): %v", len(fleet.AccountAORs()), fleet.AccountAORs())
+	log.Print("fleet ready (empty — accounts are added via the register tool)")
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "baresip-mcp",
@@ -232,8 +231,28 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "register",
-		Description: "Register an account at its provider so it can receive incoming calls. Pass regint=0 to stop registering. Pass auto_answer_after_seconds>0 to enable delayed auto-answer (gives caller a ringback window).",
+		Description: "Introduce a SIP account to the fleet and register it. Requires auth_pass the first time you call it for a given AOR; subsequent calls for the same AOR reuse the stored line if auth_pass is omitted. Pass regint=0 to stop registering. Pass auto_answer_after_seconds>0 to enable delayed auto-answer.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in registerInput) (*mcp.CallToolResult, any, error) {
+		if _, known := fleet.AccountLine(in.AOR); !known {
+			if in.Password == "" {
+				return nil, nil, fmt.Errorf("password is required when registering a new AOR (%s)", in.AOR)
+			}
+			line, err := buildAccountLine(in.AOR, in.Password, in.Username, in.ExtraParams)
+			if err != nil {
+				return nil, nil, err
+			}
+			fleet.AddAccount(in.AOR, line)
+		} else if in.Password != "" {
+			// Caller passed a (possibly new) password for an already-known
+			// AOR — rebuild the line from the new inputs so a credential
+			// rotation works without restart.
+			line, err := buildAccountLine(in.AOR, in.Password, in.Username, in.ExtraParams)
+			if err != nil {
+				return nil, nil, err
+			}
+			fleet.AddAccount(in.AOR, line)
+		}
+
 		uriParams := map[string]string{}
 		addrParams := map[string]string{}
 		if in.AutoAnswerAfter > 0 {
@@ -329,16 +348,16 @@ func main() {
 }
 
 // dialHandler issues uaaddheader/dial/uarmheader on the baresip hosting
-// in.From. Each baresip in the fleet has exactly one UA, so the UA index
-// is always 0.
+// in.Account. Each baresip in the fleet has exactly one UA, so the UA
+// index is always 0.
 func dialHandler(ctx context.Context, f *Fleet, in dialInput) (*mcp.CallToolResult, any, error) {
-	if in.From == "" {
+	if in.Account == "" {
 		return &mcp.CallToolResult{
 			IsError: true,
-			Content: []mcp.Content{&mcp.TextContent{Text: "'from' is required (which account dials)"}},
+			Content: []mcp.Content{&mcp.TextContent{Text: "'account' is required (which account dials)"}},
 		}, nil, nil
 	}
-	c, err := f.ClientFor(ctx, in.From)
+	c, err := f.ClientFor(ctx, in.Account)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -727,17 +746,39 @@ func runCmd(ctx context.Context, c *baresip.Client, cmd, params string) (*mcp.Ca
 	}, nil, nil
 }
 
-func defaultAccountsPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+// buildAccountLine assembles a baresip-format accounts file line from
+// the register tool's inputs. The line shape is
+// <sip:user@host>;auth_pass=...;auth_user=...;k=v;...
+// username defaults to the user part of the AOR (correct for sipgate
+// extensions/voizas; trunks need it set explicitly).
+func buildAccountLine(aor, password, username string, extra map[string]string) (string, error) {
+	if !strings.HasPrefix(aor, "sip:") && !strings.HasPrefix(aor, "sips:") {
+		return "", fmt.Errorf("aor must start with sip: or sips:, got %q", aor)
 	}
-	return filepath.Join(home, ".baresip", "accounts")
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if password == "" {
+		return "", fmt.Errorf("password is required")
 	}
-	return fallback
+	var b strings.Builder
+	b.WriteString("<")
+	b.WriteString(aor)
+	b.WriteString(">;auth_pass=")
+	b.WriteString(password)
+	if username != "" {
+		b.WriteString(";auth_user=")
+		b.WriteString(username)
+	}
+	// Stable iteration order so a re-register with the same inputs produces
+	// the same line (matters for the respawn-on-change comparison).
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		b.WriteString(";")
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(extra[k])
+	}
+	return b.String(), nil
 }

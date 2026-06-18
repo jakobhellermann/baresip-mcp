@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,12 +13,13 @@ import (
 	"github.com/sipgate/baresip-mcp/pkg/baresip"
 )
 
-// Fleet manages a pool of baresip child processes, one per account in
-// the user's accounts file. Children are spawned lazily on first use
-// (dial / register / accept-with-aor) so the MCP server starts quickly
-// and only the accounts you actually exercise eat memory + ports.
+// Fleet manages a pool of baresip child processes, one per registered
+// account. Accounts are introduced at runtime via the `register` MCP
+// tool — the server does not read any on-disk accounts file. Children
+// are spawned lazily on first use (dial / register / accept-with-aor)
+// so only accounts you actually exercise eat memory + ports.
 type Fleet struct {
-	accounts []accountSpec // ordered as in the accounts file
+	accounts []accountSpec // in registration order
 
 	mu      sync.Mutex
 	clients map[string]*baresip.Client
@@ -52,52 +52,32 @@ func extractAOR(accountLine string) string {
 	return uri
 }
 
-func loadAccountLines(path string) ([]string, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var lines []string
-	for _, l := range strings.Split(string(raw), "\n") {
-		trim := strings.TrimSpace(l)
-		if trim == "" || strings.HasPrefix(trim, "#") {
-			continue
-		}
-		lines = append(lines, trim)
-	}
-	return lines, nil
-}
-
-// NewFleet parses the accounts file but does not spawn anything yet.
-func NewFleet(_ context.Context, accountsPath string, bufSize int) (*Fleet, error) {
-	lines, err := loadAccountLines(accountsPath)
-	if err != nil {
-		return nil, fmt.Errorf("read accounts file %s: %w", accountsPath, err)
-	}
-	if len(lines) == 0 {
-		return nil, fmt.Errorf("no active (uncommented) accounts in %s", accountsPath)
-	}
-
-	f := &Fleet{
+// NewFleet returns an empty fleet. Accounts are added later via the
+// `register` MCP tool.
+func NewFleet(_ context.Context, bufSize int) *Fleet {
+	return &Fleet{
 		clients: map[string]*baresip.Client{},
 		insts:   map[string]*baresipInstance{},
 		calls:   map[string]string{},
 		fanout:  baresip.NewEventFanout(),
 		events:  baresip.NewEventBuffer(bufSize),
 	}
-	for _, line := range lines {
-		aor := extractAOR(line)
-		if aor == "" {
-			log.Printf("fleet: skipping account line without parseable AOR: %s", line)
-			continue
+}
+
+// AddAccount registers (or replaces) the account spec for aor. Returns
+// true if an existing entry was replaced. Does not spawn baresip — the
+// first dial / uareg / accept for this AOR will lazy-spawn.
+func (f *Fleet) AddAccount(aor, line string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, a := range f.accounts {
+		if a.aor == aor {
+			f.accounts[i].line = line
+			return true
 		}
-		f.accounts = append(f.accounts, accountSpec{aor: aor, line: line})
 	}
-	if len(f.accounts) == 0 {
-		return nil, fmt.Errorf("no parseable AORs in %s", accountsPath)
-	}
-	log.Printf("fleet: %d account(s) configured (lazy spawn): %v", len(f.accounts), f.AccountAORs())
-	return f, nil
+	f.accounts = append(f.accounts, accountSpec{aor: aor, line: line})
+	return false
 }
 
 // ensure spawns and connects the baresip for aor if it isn't already
