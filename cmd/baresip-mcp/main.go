@@ -130,6 +130,10 @@ type waitForEventOutput struct {
 	TimedOut bool                   `json:"timed_out"`
 }
 
+// version is the build version, overridden at release time via
+// -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	bufSize := flag.Int("event-buffer", 256, "size of the recent-events ring buffer")
 	flag.Parse()
@@ -145,7 +149,7 @@ func main() {
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "baresip-mcp",
-		Version: "0.1.0",
+		Version: version,
 	}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
