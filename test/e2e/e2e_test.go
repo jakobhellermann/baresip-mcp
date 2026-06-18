@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sipgate/baresip-mcp/pkg/baresip"
+	"github.com/jakobhellermann/baresip-mcp/pkg/baresip"
 )
 
 func locateModulePath(t *testing.T) string {

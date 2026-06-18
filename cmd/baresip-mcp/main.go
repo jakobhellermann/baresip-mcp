@@ -32,7 +32,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/sipgate/baresip-mcp/pkg/baresip"
+	"github.com/jakobhellermann/baresip-mcp/pkg/baresip"
 )
 
 type dialInput struct {

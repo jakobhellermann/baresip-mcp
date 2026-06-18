@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sipgate/baresip-mcp/pkg/baresip"
+	"github.com/jakobhellermann/baresip-mcp/pkg/baresip"
 )
 
 // Fleet manages a pool of baresip child processes, one per registered

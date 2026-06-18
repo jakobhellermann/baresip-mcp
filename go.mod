@@ -1,4 +1,4 @@
-module github.com/sipgate/baresip-mcp
+module github.com/jakobhellermann/baresip-mcp
 
 go 1.26.2
 
