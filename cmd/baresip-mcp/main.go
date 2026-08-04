@@ -492,34 +492,105 @@ func broadcast(ctx context.Context, f *Fleet, cmd, params string) (*mcp.CallTool
 // next event starts.
 const dtmfInterDigitGap = 450 * time.Millisecond
 
+// maxDTMFSendAttempts bounds per-digit retries after a DTMF_SEND_FAILED.
+const maxDTMFSendAttempts = 3
+
 // sendDTMF sends DTMF digits one at a time so each digit gets its own
-// proper RFC2833 send-then-release pair. Returns the result of the final
-// digit (any per-digit error short-circuits).
+// proper RFC2833 send-then-release pair (or SIP INFO in the fleet's
+// default dtmfmode=info). The inter-digit gap doubles as the observation
+// window for asynchronous DTMF_SEND_FAILED events: only one digit is
+// ever in flight, so a failure surfacing during the gap belongs to the
+// digit just sent, and exactly that digit is retried in place — resending
+// later would reorder or duplicate digits.
 func sendDTMF(ctx context.Context, f *Fleet, callID, digits string) (*mcp.CallToolResult, any, error) {
 	if digits == "" {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "ok: dtmf (no digits)"}},
 		}, nil, nil
 	}
-	var last *mcp.CallToolResult
-	for i := 0; i < len(digits); i++ {
-		res, _, err := broadcastOrTargeted(ctx, f, "", callID, "sndcode", string(digits[i]))
-		if err != nil {
-			return nil, nil, err
-		}
-		last = res
-		if res != nil && res.IsError {
-			return res, nil, nil
-		}
-		if i < len(digits)-1 {
-			select {
-			case <-time.After(dtmfInterDigitGap):
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			}
+
+	var aor string
+	if callID != "" {
+		if _, a, err := f.ClientForCall(callID); err == nil {
+			aor = a
 		}
 	}
-	return last, nil, nil
+	events, unsub := f.Fanout().Subscribe()
+	defer unsub()
+
+	retries := 0
+	var lost []string
+	for i := 0; i < len(digits); i++ {
+		digit := string(digits[i])
+		delivered := false
+		for attempt := 1; attempt <= maxDTMFSendAttempts; attempt++ {
+			res, _, err := broadcastOrTargeted(ctx, f, "", callID, "sndcode", digit)
+			if err != nil {
+				return nil, nil, err
+			}
+			if res != nil && res.IsError {
+				return res, nil, nil
+			}
+			failed, err := dtmfFailureDuringGap(ctx, events, aor)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !failed {
+				delivered = true
+				break
+			}
+			retries++
+		}
+		if !delivered {
+			lost = append(lost, digit)
+		}
+	}
+
+	if len(lost) > 0 {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
+				"dtmf digit(s) %s not delivered: every send got DTMF_SEND_FAILED (%d attempts each)",
+				strings.Join(lost, ","), maxDTMFSendAttempts)}},
+		}, nil, nil
+	}
+	msg := "ok: dtmf"
+	if retries > 0 {
+		msg = fmt.Sprintf("ok: dtmf (%d send(s) retried after DTMF_SEND_FAILED)", retries)
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+	}, nil, nil
+}
+
+// dtmfFailureDuringGap waits out the inter-digit gap while watching for a
+// DTMF_SEND_FAILED event from the sending instance. The INFO response
+// round trip is well below the gap, so a failure of the in-flight digit
+// is observed here and not misattributed to a later one.
+func dtmfFailureDuringGap(ctx context.Context, events <-chan baresip.Event, aor string) (bool, error) {
+	timer := time.NewTimer(dtmfInterDigitGap)
+	defer timer.Stop()
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return false, nil
+			}
+			if ev.Type != "DTMF_SEND_FAILED" {
+				continue
+			}
+			if aor != "" {
+				if a, _ := ev.Extra["fleet_aor"].(string); a != aor {
+					continue
+				}
+			}
+			return true, nil
+		case <-timer.C:
+			return false, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 }
 
 // broadcastOrTargeted routes to a specific baresip if aor or callID

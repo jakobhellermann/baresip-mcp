@@ -107,7 +107,21 @@ func (f *Fleet) ensure(ctx context.Context, aor string) (*baresip.Client, error)
 	}
 	f.mu.Unlock()
 
-	inst, err := spawnBaresip(spawnParams{sipPort: sipPort, accountsLine: line})
+	inst, err := spawnBaresip(spawnParams{
+		sipPort:      sipPort,
+		accountsLine: line,
+		onDTMFInfoFailure: func(detail string) {
+			ev := baresip.Event{
+				Class: "call",
+				Type:  "DTMF_SEND_FAILED",
+				Param: detail,
+				Extra: map[string]any{"fleet_aor": aor},
+			}
+			f.events.Add(ev)
+			f.fanout.Publish(ev)
+			log.Printf("baresip[%s] dtmf send failed: %s", aor, detail)
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("spawn baresip for %s: %w", aor, err)
 	}

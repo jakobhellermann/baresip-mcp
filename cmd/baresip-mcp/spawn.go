@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -124,6 +128,52 @@ func extractTmpDir(args, tmpRoot string) string {
 type spawnParams struct {
 	sipPort      int    // 0 = baresip picks (use 5060 for the first instance to maximize NAT-pinhole stability)
 	accountsLine string // single-account line; empty means baresip starts with zero UAs
+
+	// onDTMFInfoFailure fires once per "call: sending DTMF INFO failed"
+	// warning in the baresip output, with the parenthesized reason
+	// (e.g. "scode: 500"). baresip only logs this — there is no ctrl_tcp
+	// event — so the output stream is the only place to observe it.
+	onDTMFInfoFailure func(detail string)
+}
+
+var (
+	ansiSeqRE        = regexp.MustCompile("\x1b\\[[0-9;]*m")
+	dtmfInfoFailedRE = regexp.MustCompile(`sending DTMF INFO failed \(([^)]*)\)`)
+)
+
+// watchBaresipOutput copies baresip's combined stdout/stderr into logFile
+// while scanning it for the DTMF-INFO-failure warning. Owns both ends:
+// closes them when the child's output hits EOF.
+func watchBaresipOutput(r io.ReadCloser, logFile *os.File, onDTMFInfoFailure func(string)) {
+	defer r.Close()
+	defer logFile.Close()
+	sc := bufio.NewScanner(io.TeeReader(r, logFile))
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	sc.Split(scanCROrLF)
+	for sc.Scan() {
+		if onDTMFInfoFailure == nil {
+			continue
+		}
+		line := ansiSeqRE.ReplaceAllString(sc.Text(), "")
+		for _, m := range dtmfInfoFailedRE.FindAllStringSubmatch(line, -1) {
+			onDTMFInfoFailure(m[1])
+		}
+	}
+}
+
+// scanCROrLF splits on \n or \r: baresip's status ticker redraws via bare
+// \r, which would otherwise accumulate into one endless line.
+func scanCROrLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 // withAccountParam appends ";<key>=<value>" to a baresip account line if
@@ -239,22 +289,37 @@ audio_buffer_mode       fixed
 		return nil, err
 	}
 
+	// Pipe the output through us instead of handing logFile to the child:
+	// the watcher tees into logFile and scans for log-only warnings.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		logFile.Close()
+		_ = os.RemoveAll(tmp)
+		return nil, err
+	}
+
 	cmd := exec.Command("baresip", "-f", cfgDir)
 	cmd.Env = append(os.Environ(), "HOME="+tmp)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 	if err := cmd.Start(); err != nil {
+		pw.Close()
+		pr.Close()
 		logFile.Close()
 		_ = os.RemoveAll(tmp)
 		return nil, fmt.Errorf("start baresip (is it on PATH?): %w", err)
 	}
+	// Close our copy of the write end so the watcher sees EOF when the
+	// child exits.
+	pw.Close()
+	go watchBaresipOutput(pr, logFile, p.onDTMFInfoFailure)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	if err := waitForCtrlTCP(addr, 5*time.Second); err != nil {
 		// Surface baresip's log so the user has a chance at diagnosing.
+		// The watcher goroutine owns logFile and closes it on EOF.
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-		logFile.Close()
 		logBody, _ := os.ReadFile(logPath)
 		_ = os.RemoveAll(tmp)
 		return nil, fmt.Errorf("baresip ctrl_tcp on %s never came up: %w\n--- baresip log ---\n%s", addr, err, logBody)
