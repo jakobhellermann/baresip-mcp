@@ -1,3 +1,5 @@
+**Status:** AI slop but it works for me
+
 # baresip-mcp
 
 An [MCP](https://modelcontextprotocol.io) server that drives
