@@ -76,13 +76,13 @@ func writePCMWAV(path string, build func(addTone func(freq float64, ms int, amp 
 	if _, err := f.Write([]byte("WAVEfmt ")); err != nil {
 		return err
 	}
-	_ = binary.Write(f, binary.LittleEndian, uint32(16))    // PCM header size
-	_ = binary.Write(f, binary.LittleEndian, uint16(1))     // PCM format
-	_ = binary.Write(f, binary.LittleEndian, uint16(1))     // mono
+	_ = binary.Write(f, binary.LittleEndian, uint32(16)) // PCM header size
+	_ = binary.Write(f, binary.LittleEndian, uint16(1))  // PCM format
+	_ = binary.Write(f, binary.LittleEndian, uint16(1))  // mono
 	_ = binary.Write(f, binary.LittleEndian, uint32(sampleRate))
 	_ = binary.Write(f, binary.LittleEndian, uint32(sampleRate*2)) // byte rate
-	_ = binary.Write(f, binary.LittleEndian, uint16(2))     // block align
-	_ = binary.Write(f, binary.LittleEndian, uint16(16))    // bits per sample
+	_ = binary.Write(f, binary.LittleEndian, uint16(2))            // block align
+	_ = binary.Write(f, binary.LittleEndian, uint16(16))           // bits per sample
 	if _, err := f.Write([]byte("data")); err != nil {
 		return err
 	}

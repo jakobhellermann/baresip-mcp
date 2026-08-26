@@ -167,4 +167,3 @@ func TestClientDoFailsWhenDisconnected(t *testing.T) {
 		t.Fatal("expected ErrDisconnected")
 	}
 }
-

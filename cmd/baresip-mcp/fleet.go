@@ -21,12 +21,12 @@ import (
 type Fleet struct {
 	accounts []accountSpec // in registration order
 
-	mu      sync.Mutex
-	clients map[string]*baresip.Client
-	insts   map[string]*baresipInstance
-	calls   map[string]string // call_id -> aor
-	fanout  *baresip.EventFanout
-	events  *baresip.EventBuffer
+	mu       sync.Mutex
+	clients  map[string]*baresip.Client
+	insts    map[string]*baresipInstance
+	calls    map[string]string // call_id -> aor
+	fanout   *baresip.EventFanout
+	events   *baresip.EventBuffer
 	used5060 bool
 }
 

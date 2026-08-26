@@ -432,4 +432,3 @@ func detectModulePath() (string, error) {
 	}
 	return "", fmt.Errorf("baresip ctrl_tcp.so module not found in any known path; set BARESIP_MODPATH")
 }
-

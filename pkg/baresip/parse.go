@@ -26,8 +26,9 @@ type UserAgentCalls struct {
 }
 
 // callLineRE matches a single line from baresip's ua_print_calls output, e.g.
-//   "> [line 1, id deadbeef]  00:00:42  ESTABLISHED  (on hold)  sip:bob@x"
-//   "  [line 2, id cafebabe]  00:00:01  RINGING                 sip:c@x"
+//
+//	"> [line 1, id deadbeef]  00:00:42  ESTABLISHED  (on hold)  sip:bob@x"
+//	"  [line 2, id cafebabe]  00:00:01  RINGING                 sip:c@x"
 var callLineRE = regexp.MustCompile(
 	`^([>\s])\s*\[line\s+(\d+),\s*id\s+(\S+)\]\s+(\S+)\s+(\S+)\s+(\(on hold\)|\s{9})\s+(\S+)\s*$`)
 
@@ -76,10 +77,11 @@ type Registration struct {
 }
 
 // regLineRE matches one line of ua_print_status + reg_status output, e.g.:
-//   "0 - sip:alice@example.com    OK  sip:srv.example.com  Expires 60s"
-//   "1 - sip:bob@example.com      FB-ERR sip:fallback.example.com"
-//   "0 - sip:carol@example.com    zzz"
-//   "0 - sip:dave@example.com"                                  ← regint=0, no reg object
+//
+//	"0 - sip:alice@example.com    OK  sip:srv.example.com  Expires 60s"
+//	"1 - sip:bob@example.com      FB-ERR sip:fallback.example.com"
+//	"0 - sip:carol@example.com    zzz"
+//	"0 - sip:dave@example.com"                                  ← regint=0, no reg object
 //
 // The status token is optional: accounts with regint=0 don't create a
 // reg object so baresip emits only the AOR.

@@ -4,7 +4,8 @@
 // ctrl_tcp to verify the baresip-mcp client end-to-end on a real call.
 //
 // Run with:
-//   go test -tags e2e ./test/e2e/ -v
+//
+//	go test -tags e2e ./test/e2e/ -v
 //
 // Requires baresip on PATH. The module path is autodetected for
 // homebrew (macOS) and debian-multiarch (linux); override with
@@ -45,10 +46,10 @@ func locateModulePath(t *testing.T) string {
 }
 
 type instance struct {
-	name    string
-	cmd     *exec.Cmd
-	homeDir string
-	sipPort int
+	name     string
+	cmd      *exec.Cmd
+	homeDir  string
+	sipPort  int
 	ctrlAddr string
 }
 
