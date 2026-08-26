@@ -86,9 +86,9 @@ type registerInput struct {
 	Password        string            `json:"password,omitempty" jsonschema:"SIP authentication password. Required the first time you register a given AOR; on subsequent register calls for the same AOR the stored line is reused if omitted. The password lives only in memory and in the spawned baresip child's tmpdir."`
 	Username        string            `json:"username,omitempty" jsonschema:"SIP authentication username. Optional — defaults to the user part of the AOR, which is correct for sipgate extensions/voizas. Trunks typically need it set explicitly to the trunk-extension id."`
 	ExtraParams     map[string]string `json:"extra_params,omitempty" jsonschema:"optional additional baresip account params appended after the AOR (e.g. {\"audio_codecs\": \"pcma\", \"stunserver\": \"stun:stun.sipgate.net\"}). Only applied when introducing a new AOR; ignored on re-registration of a known AOR."`
-	Regint          int               `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 60). Short by design so the NAT/VPN pinhole keeping the inbound path open is refreshed before consumer-router UDP mappings expire (typically 30–180s). Set to 0 to stop registering."`
+	Regint          int               `json:"regint,omitempty" jsonschema:"registration interval in seconds (default 60). Kept short so a dropped registration is re-established quickly rather than leaving the account silently unreachable. Set to 0 to stop registering."`
 	AutoAnswerAfter int               `json:"auto_answer_after_seconds,omitempty" jsonschema:"if >0, configure baresip to auto-answer incoming calls after this many seconds, giving the caller a ringback window. Appends ;answerdelay=N (in ms; baresip uses MIN_RINGTIME=1000) to this account's in-memory line. Triggers a respawn of the baresip for this AOR if one is already running."`
-	Transport       string            `json:"transport,omitempty" jsonschema:"SIP transport: 'udp' (default), 'tcp', or 'tls'. Non-UDP options often need a matching outbound_proxy because the registrar host may only listen UDP on its default address. For sipgate use outbound_proxy=sip:sip.dev.sipgate.de (dev) or sip:sip.sipgate.de (prod) when transport is tcp/tls/ws."`
+	Transport       string            `json:"transport,omitempty" jsonschema:"SIP transport: 'tcp' (default), 'udp', or 'tls'. TCP is the default because it is what registrars here actually serve: against sipgate dev a 'udp' account either never completes REGISTER or ends up on some other transport anyway. Any transport generally needs a matching outbound_proxy — without one the REGISTER is answered 401 and not retried. For sipgate use outbound_proxy=sip:sip.dev.sipgate.de (dev) or sip:sip.sipgate.de (prod)."`
 	OutboundProxy   string            `json:"outbound_proxy,omitempty" jsonschema:"explicit outbound SIP proxy (e.g. 'sip:sip.dev.sipgate.de'). Combined with transport to produce an outbound URI baresip uses for REGISTER + INVITE. Triggers a respawn if already running."`
 }
 
@@ -272,13 +272,27 @@ func main() {
 			// MIN_RINGTIME=1000 in menu.c). Our tool param is seconds.
 			addrParams["answerdelay"] = fmt.Sprintf("%d", in.AutoAnswerAfter*1000)
 		}
-		if in.Transport != "" {
-			uriParams["transport"] = in.Transport
+		// Default to TCP rather than baresip's UDP: measured against sipgate dev, a
+		// udp account either never completes REGISTER at all or is answered on a
+		// different transport, while tcp and tls both register and receive INVITEs.
+		transport := in.Transport
+		if transport == "" {
+			transport = "tcp"
+		}
+		uriParams["transport"] = transport
+		// A proxy that couples media security to signaling security answers a TLS
+		// registration with an RTP/SAVP offer, which baresip rejects as "no common
+		// audio or video codecs" unless srtp is enabled. srtp-mand, not srtp-opt:
+		// the latter only offers SRTP alongside plain RTP and still rejects a
+		// SAVP-only offer. Only set mediaenc when the build ships the module —
+		// baresip fails the whole account with "mediaenc not found" otherwise.
+		if _, set := in.ExtraParams["mediaenc"]; !set && transport == "tls" && srtpAvailable() {
+			addrParams["mediaenc"] = "srtp-mand"
 		}
 		if in.OutboundProxy != "" {
 			outbound := in.OutboundProxy
-			if in.Transport != "" && !strings.Contains(outbound, "transport=") {
-				outbound = outbound + ";transport=" + in.Transport
+			if !strings.Contains(outbound, "transport=") {
+				outbound = outbound + ";transport=" + transport
 			}
 			addrParams["outbound"] = outbound
 		}

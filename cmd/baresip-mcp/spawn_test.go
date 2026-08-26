@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -69,4 +70,37 @@ func TestWatchBaresipOutputNilCallback(t *testing.T) {
 	}
 	pw.Close()
 	<-done
+}
+
+func TestRenderConfigLoadsSrtpBeforeAccount(t *testing.T) {
+	cfg := renderConfig(configParams{
+		sipListen:   "0.0.0.0:0",
+		modPath:     "/mods",
+		srtpModule:  "module                  srtp.so",
+		audioModule: "module coreaudio.so",
+		ctrlPort:    4444,
+	})
+
+	srtp := strings.Index(cfg, "srtp.so")
+	account := strings.Index(cfg, "account.so")
+	if srtp < 0 || account < 0 {
+		t.Fatalf("expected both modules in config, got:\n%s", cfg)
+	}
+	// account.so resolves an account's mediaenc as it parses the accounts file.
+	// Loaded first, it drops mediaenc=srtp-mand with a mere warning and the
+	// account then rejects every RTP/SAVP offer it is sent.
+	if srtp > account {
+		t.Errorf("srtp.so must be loaded before account.so, got:\n%s", cfg)
+	}
+}
+
+func TestRenderConfigOmitsAbsentSrtpModule(t *testing.T) {
+	cfg := renderConfig(configParams{sipListen: "0.0.0.0:0", modPath: "/mods", ctrlPort: 4444})
+
+	if strings.Contains(cfg, "srtp.so") {
+		t.Errorf("expected no srtp module line, got:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "module                  account.so") {
+		t.Errorf("expected account.so to survive an empty srtp line, got:\n%s", cfg)
+	}
 }
